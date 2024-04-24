@@ -2,8 +2,8 @@ import sys
 import os
 import re
 import numpy as np
-from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QPushButton, QFileDialog, QTextEdit, QLabel, QLineEdit
-from PyQt5.QtCore import Qt
+from PyQt6.QtWidgets import QApplication, QWidget, QVBoxLayout, QPushButton, QFileDialog, QTextEdit, QLabel, QLineEdit
+from PyQt6.QtCore import Qt
 from PIL import Image, ImageOps, ImageEnhance
 
 class JpegToolGUI(QWidget):
@@ -75,10 +75,7 @@ class JpegToolGUI(QWidget):
         self.btnAutoColor.clicked.connect(self.autoColorImages)
 
     def selectReferenceJPEG(self):
-        options = QFileDialog.Options()
-        options |= QFileDialog.ReadOnly
-
-        fileName, _ = QFileDialog.getOpenFileName(self, "Select Reference JPEG", "", "JPEG Files (*.jpg);;All Files (*)", options=options)
+        fileName, _ = QFileDialog.getOpenFileName(self, "Select Reference JPEG", "", "JPEG Files (*.jpg);;All Files (*)")
 
         if fileName:
             self.reference_jpeg_input.setText(fileName)
@@ -133,7 +130,7 @@ class JpegToolGUI(QWidget):
 
             offset = f + 2
             if offset <= len(s):
-                m = ord(s[f + 1:f + 2])
+                m = s[f + 1]
                 if m in marker_name:
                     segments[f] = m
 
@@ -270,7 +267,7 @@ def main():
     app = QApplication(sys.argv)
     window = JpegToolGUI()
     window.show()
-    sys.exit(app.exec_())
+    sys.exit(app.exec())
 
 if __name__ == "__main__":
     main()
