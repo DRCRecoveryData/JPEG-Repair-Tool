@@ -6,7 +6,7 @@ This is a simple GUI tool for repairing JPEG images by shifting MCU and applying
 
 ## Overview
 
-This tool is built using Python and PyQt5. It provides a user-friendly interface to repair JPEG images corrupted due to encryption or other issues.
+This tool is built using Python and PyQt6. It provides a user-friendly interface to repair JPEG images corrupted due to encryption or other issues.
 
 ## Features
 
@@ -18,7 +18,7 @@ This tool is built using Python and PyQt5. It provides a user-friendly interface
 ## Requirements
 
 - Python 3.x
-- PyQt5
+- PyQt6
 - NumPy
 - Pillow (PIL)
 
@@ -42,5 +42,5 @@ This project is licensed under the Creative Commons Attribution-NonCommercial 4.
 ## Acknowledgments
 
 - This tool is inspired by the need to recover corrupted JPEG images efficiently.
-- Special thanks to the developers of PyQt5, NumPy, and Pillow for their amazing libraries.
+- Special thanks to the developers of PyQt6, NumPy, and Pillow for their amazing libraries.
 
