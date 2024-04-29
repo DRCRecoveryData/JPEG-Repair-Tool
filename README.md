@@ -22,6 +22,8 @@ This tool is built using Python and PyQt6. It provides a user-friendly interface
 - NumPy
 - Pillow (PIL)
 
+```pip install pyqt6 numpy pillow```
+
 ## Usage
 
 1. Install the required dependencies.
