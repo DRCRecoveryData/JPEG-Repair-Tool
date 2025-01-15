@@ -4,6 +4,15 @@
 
 This is a simple GUI tool for repairing JPEG images by shifting MCU and applying auto color enhancements.
 
+## Table of Contents
+- [Overview](#overview)
+- [Installation](#installation)
+- [Usage](#usage)
+- [Contributing](#contributing)
+- [License](#license)
+- [References](#references)
+- [Contact](#contact)
+
 ## Overview
 
 This tool is built using Python and PyQt6. It provides a user-friendly interface to repair JPEG images corrupted due to encryption or other issues.
@@ -24,6 +33,18 @@ This tool is built using Python and PyQt6. It provides a user-friendly interface
 
 ```pip install pyqt6 numpy pillow```
 
+## Installation
+
+To install the JPEG Repair Tool:
+
+1. Download the latest release from the [releases page](https://github.com/DRCRecoveryData/JPEG-Repair-Tool/releases).
+2. Extract the contents to a directory.
+3. Ensure you have Python installed. You can download it from [python.org](https://www.python.org/).
+4. Install the required dependencies:
+    ```sh
+    pip install -r requirements.txt
+    ```
+
 ## Usage
 
 1. Install the required dependencies.
@@ -35,14 +56,29 @@ This tool is built using Python and PyQt6. It provides a user-friendly interface
 
 ## How it works
 
-The tool first identifies the MCU shift required for each corrupted JPEG image. Then, it applies the necessary shift and saves the repaired images. Optionally, it applies auto color enhancement to improve the visual quality of the images.
+The tool first identifies the MCU shift required for each corrupted JPEG image. Then, it applies the necessary shift and saves the repaired images. Optionally, it applies auto color enhancement to the images.
+
+## Contributing
+
+We welcome contributions! To contribute:
+
+1. Fork the repository.
+2. Create a new branch.
+3. Make your changes.
+4. Submit a pull request.
+
+For issues or suggestions, please open an issue on GitHub.
 
 ## License
 
-This project is licensed under the Creative Commons Attribution-NonCommercial 4.0 International License (CC BY-NC 4.0). See the [LICENSE](LICENSE) file for details.
+This project is licensed under the GNU General Public License (GPL). See the [LICENSE](LICENSE) file for details.
 
-## Acknowledgments
+## References
 
-- This tool is inspired by the need to recover corrupted JPEG images efficiently.
-- Special thanks to the developers of PyQt6, NumPy, and Pillow for their amazing libraries.
+- [Stop/DJVU Ransomware Description on Bleeping Computer](https://www.bleepingcomputer.com/news/security/djvu-ransomware-updated-to-v91-uses-new-encryption-mode/)
+- [Python Programming Language](https://www.python.org/)
+- [PyQt6 Library](https://pypi.org/project/PyQt6/)
 
+## Contact
+
+For support or questions, please contact us at [hanaloginstruments@gmail.com](mailto:hanaloginstruments@gmail.com).
