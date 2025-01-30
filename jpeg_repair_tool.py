@@ -127,7 +127,7 @@ class JpegToolGUI(QWidget):
         cut_reference_data = reference_data[:ffda_offset + 12]
 
         # Merge the cut reference data with the remaining encrypted data after 153605
-        repaired_data = cut_reference_data + encrypted_data[153606:]
+        repaired_data = cut_reference_data + encrypted_data[153605:]
 
         # Remove EXIF metadata
         repaired_data = self.remove_exif(repaired_data)
@@ -194,7 +194,7 @@ class JpegToolGUI(QWidget):
                 enhancer = ImageEnhance.Sharpness(im).enhance(3)
                 im = ImageOps.posterize(im, bits=8)
                 enhancer = ImageEnhance.Color(im).enhance(3)
-                im.save(image_path, quality="maximum")
+                im.save(image_path)
                 self.outputText.append(f"Auto color applied to {jpg_file} and saved.")
             except Exception as e:
                 self.outputText.append(f"Error processing image {jpg_file}: {str(e)}")
