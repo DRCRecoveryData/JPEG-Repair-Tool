@@ -103,63 +103,76 @@ class JpegToolGUI(QWidget):
         for encrypted_file in os.listdir(encrypted_folder):
             if pattern.match(encrypted_file):  # Matches files like *.JPG.****
                 output_file = os.path.join(repaired_folder, os.path.splitext(encrypted_file)[0].rsplit('.', 1)[0] + '.JPG')
-                offset = self.find_jpeg_markers(reference_jpeg, 'ECS')
-                self.dd_replacement(reference_jpeg, output_file, bs=1, count=offset)
-                self.dd_replacement(os.path.join(encrypted_folder, encrypted_file), output_file, bs=1024, skip=153605)
+                self.process_jpeg(reference_jpeg, os.path.join(encrypted_folder, encrypted_file), output_file)
                 self.outputText.append(f"Processed {encrypted_file} to {output_file}")
 
         self.outputText.append("Repair complete.")
 
-    def find_jpeg_markers(self, filename, marker=None):
-        with open(filename, "rb") as f:
-            s = f.read()
+    def process_jpeg(self, reference_path, encrypted_path, output_path):
+        # Load the encrypted JPEG file
+        with open(encrypted_path, 'rb') as encrypted_file:
+            encrypted_data = encrypted_file.read()
 
-        marker_name = {
-            0xd8: "SOI", 0xe0: "APP0", 0xe1: "APP1", 0xdb: "DQT",
-            0xc0: "SOF", 0xc4: "DHT", 0xda: "SOS", 0xd9: "EOI",
-            0: "ECS"
-        }
+        # Cut the encrypted data from offset 0 to 153605 (inclusive)
+        cut_encrypted_data = encrypted_data[:153605]
 
-        segments = {}
-        offset = 0
+        # Load the reference JPEG file
+        with open(reference_path, 'rb') as reference_file:
+            reference_data = reference_file.read()
 
-        while True:
-            f = s.find(b"\xff", offset)
-            if f < 0:
-                break
+        # Find the last FFDA marker in the reference data
+        ffda_offset = self.find_ffda_offset(reference_data)
 
-            offset = f + 2
-            if offset <= len(s):
-                m = s[f + 1]
-                if m in marker_name:
-                    segments[f] = m
+        # Cut the reference data from offset 0 to FFDA + 12 bytes
+        cut_reference_data = reference_data[:ffda_offset + 12]
 
-        if marker and marker.upper() == "ECS":
-            last_sos_offset = None
-            for f in reversed(sorted(segments.keys())):
-                if marker_name[segments[f]] == "SOS":
-                    last_sos_offset = f
-                    break
+        # Merge the cut reference data with the remaining encrypted data after 153605
+        repaired_data = cut_reference_data + encrypted_data[153606:]
 
-            if last_sos_offset is not None:
-                return last_sos_offset + 12
-        elif marker:
-            for f in reversed(sorted(segments.keys())):
-                if marker_name[segments[f]] == marker.upper():
-                    return f
-        else:
-            offsets = [(marker_name[segments[f]], f) for f in sorted(segments.keys())]
-            return offsets
+        # Remove EXIF metadata
+        repaired_data = self.remove_exif(repaired_data)
 
-    def dd_replacement(self, input_file, output_file, bs=1, count=None, skip=None):
-        with open(input_file, "rb") as f:
-            if skip:
-                f.seek(skip)
+        # Remove 334 bytes from the end of the repaired data
+        repaired_data = repaired_data[:-334]
 
-            data = f.read(bs * count if count else -1)
+        # Save the repaired data to the output path
+        with open(output_path, 'wb') as output_file:
+            output_file.write(repaired_data)
 
-        with open(output_file, "ab") as f:
-            f.write(data)
+    def find_ffda_offset(self, data):
+        # Find the last occurrence of FFDA marker in the JPEG data
+        ffda_marker = b'\xFF\xDA'
+        ffda_offset = data.rfind(ffda_marker)
+        if ffda_offset == -1:
+            raise ValueError("FFDA marker not found in the reference JPEG file.")
+        return ffda_offset
+
+    def remove_exif(self, data):
+        # JPEG markers that indicate the start of a segment
+        marker_start = b'\xFF'
+        app1_marker = b'\xFF\xE1'  # APP1 marker (where EXIF data is stored)
+
+        i = 0
+        while i < len(data) - 1:
+            # Check if the current byte is a marker start
+            if data[i] == 0xFF:
+                marker = data[i:i+2]  # Get the marker (2 bytes)
+
+                # If the marker is APP1 (EXIF data), remove the entire segment
+                if marker == app1_marker:
+                    segment_length = int.from_bytes(data[i+2:i+4], byteorder='big') + 2
+                    data = data[:i] + data[i+segment_length:]  # Remove the segment
+                    continue  # Continue parsing from the current position
+
+                # Skip other markers (except SOI and EOI)
+                if marker not in (b'\xFF\xD8', b'\xFF\xD9'):  # Skip SOI and EOI
+                    segment_length = int.from_bytes(data[i+2:i+4], byteorder='big') + 2
+                    i += segment_length  # Move to the next segment
+                    continue
+
+            i += 1  # Move to the next byte
+
+        return data
 
     def autoColorImages(self):
         repaired_folder = os.path.join(self.encrypted_folder_input.text().strip(), "Repaired")
