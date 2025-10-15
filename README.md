@@ -40,7 +40,7 @@ You need **Python 3.x** installed on your system.
 
 1.  **Clone the repository** or [download the latest release](https://github.com/DRCRecoveryData/JPEG-Repair-Tool/releases):
     ```sh
-    git clone [https://github.com/DRCRecoveryData/JPEG-Repair-Tool.git](https://github.com/DRCRecoveryData/JPEG-Repair-Tool.git)
+    git clone https://github.com/DRCRecoveryData/JPEG-Repair-Tool.git
     cd JPEG-Repair-Tool
     ```
 
