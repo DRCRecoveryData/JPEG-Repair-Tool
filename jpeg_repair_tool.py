@@ -116,25 +116,26 @@ def is_mcu_scanline_gray(pixels, gray_tolerance=10, color_std_dev_threshold=5):
     return is_color_neutral and is_color_uniform
 
 # --- FIXED: Iterates backward to find contiguous gray blocks at the footer ---
-def count_gray_mcu_scanlines(filepath, mcu_data, gray_tolerance=10, color_std_dev_threshold=5):
+def count_gray_mcu_scanlines(filepath, mcu_data, gray_tolerance=10, color_std_dev_threshold=5, skip_top_scanlines=1):
     """
-    (Used for Header Crop) Iterates backward through vertical MCU scanlines 
-    and counts how many contiguous gray scanlines are at the end (footer).
+    Counts contiguous gray MCU scanlines from the bottom of the image.
+    Skips the first 'skip_top_scanlines' scanlines to avoid false positives at the top.
     """
-    if not mcu_data: return 0, 0, []
+    if not mcu_data:
+        return 0, 0, []
 
     try:
         img = Image.open(filepath).convert('YCbCr')
         img_array = np.array(img)
         height = img_array.shape[0]
         mcu_y = mcu_data['mcu_y']
-        total_mcu_scanlines = mcu_data['n_mcu_y'] 
+        total_mcu_scanlines = mcu_data['n_mcu_y']
         
         gray_scanline_count = 0
         gray_scanline_indices = []
 
-        # Iterate backward from the last scanline
-        for i in range(total_mcu_scanlines - 1, -1, -1):
+        # Iterate backward through MCU scanlines, skipping the top ones
+        for i in range(total_mcu_scanlines - 1, skip_top_scanlines - 1, -1):
             start_row = i * mcu_y
             end_row = min((i + 1) * mcu_y, height)
 
@@ -143,15 +144,16 @@ def count_gray_mcu_scanlines(filepath, mcu_data, gray_tolerance=10, color_std_de
 
             if is_mcu_scanline_gray(pixels, gray_tolerance, color_std_dev_threshold):
                 gray_scanline_count += 1
-                gray_scanline_indices.insert(0, i) # Keep indices in ascending order
+                gray_scanline_indices.insert(0, i)  # Keep indices in ascending order
             else:
-                 # Break on the first non-gray scanline encountered from the bottom
-                 break 
+                # Stop when encountering the first non-gray scanline from the bottom
+                break
 
         return gray_scanline_count, total_mcu_scanlines, gray_scanline_indices
-        
-    except Exception:
-        # If Pillow/NumPy fails, return 0
+
+    except Exception as e:
+        # If an error occurs, return 0 and log the error
+        print(f"Error in count_gray_mcu_scanlines: {e}")
         return 0, 0, []
         
         
