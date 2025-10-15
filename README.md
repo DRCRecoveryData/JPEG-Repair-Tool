@@ -1,6 +1,7 @@
 # JPEG Repair Tool
 
-![2024-04-24_004544](https://github.com/DRCRecoveryData/JPEG-Repair-Tool/assets/85211068/673f449b-be21-4075-8441-eef37a9f9dc0)
+<img width="1920" height="1032" alt="image" src="https://github.com/user-attachments/assets/82e97354-ef79-4ef9-81e1-2fc5b8b39a56" />
+<img width="1920" height="1032" alt="image" src="https://github.com/user-attachments/assets/83c6fe1b-befb-4e07-9e01-c1791315b6cd" />
 
 This is a simple GUI tool for repairing JPEG images by shifting MCU and applying auto color enhancements.
 
