@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, 
     QGridLayout, QLabel, QPushButton, QFileDialog,
     QMessageBox, QGraphicsView, QGraphicsScene, QGraphicsItem,
-    QLineEdit, QHBoxLayout, QSlider
+    QLineEdit, QHBoxLayout, QSlider, QSizePolicy
 )
 from PyQt6.QtGui import QPainter, QColor, QPen, QPixmap
 from PyQt6.QtCore import Qt, QRectF, QRect, QPointF, QBuffer, QIODevice
@@ -27,7 +27,7 @@ except ImportError:
 # --- JPEG HEADER & SCANLINE LOGIC ---
 # ======================================================================
 
-def get_jpeg_mcu_data(filepath):
+def get_jpeg_mcu_data(filepath: str) -> dict | None:
     """Calculates MCU dimensions and total MCU count by reading the SOF0/SOF2 header."""
     if not os.path.exists(filepath): return None
 
@@ -54,11 +54,14 @@ def get_jpeg_mcu_data(filepath):
                 elif marker[0] == 0xff and marker[1] in (0xd8, 0xd9): continue
                 else: f.seek(-1, 1)
 
-            height_y, width_x = struct.unpack('>HH', sof_data[1:5])
-            num_components = sof_data[5]
+            # Check if SOF data is long enough and indicates 3 components (Y, Cb, Cr)
+            if sof_data is None or len(sof_data) < 12 or sof_data[5] != 3: 
+                # Basic check for 3 components (sof_data[5] is num_components)
+                return None 
 
-            if num_components != 3 or len(sof_data) < 13 or sof_data[12] != 3: return None
+            height_y, width_x = struct.unpack('>HH', sof_data[1:5])
             
+            # The sampling factor is in sof_data[7] for the first component (Y)
             y_sampling_factor_byte = sof_data[7]
             y_hor = (y_sampling_factor_byte >> 4) & 0x0F
             y_ver = y_sampling_factor_byte & 0x0F
@@ -66,6 +69,8 @@ def get_jpeg_mcu_data(filepath):
             mcu_x = y_hor * 8
             mcu_y = y_ver * 8
             
+            if mcu_x == 0 or mcu_y == 0: return None # Invalid MCU size
+
             n_mcu_x = (width_x + mcu_x - 1) // mcu_x
             n_mcu_y = (height_y + mcu_y - 1) // mcu_y
             
@@ -77,10 +82,9 @@ def get_jpeg_mcu_data(filepath):
     except Exception:
         return None
 
-def is_mcu_scanline_gray(pixels, gray_tolerance=10, color_std_dev_threshold=5):
+def is_mcu_scanline_gray(pixels: np.ndarray, gray_tolerance: int = 10, color_std_dev_threshold: int = 5) -> bool:
     """
     Checks if a 2D array of YCbCr pixels (whether full scanline or single MCU) is gray using NumPy.
-    Defaults set to 10 and 5.
     """
     if pixels.size == 0:
         return False
@@ -103,7 +107,7 @@ def is_mcu_scanline_gray(pixels, gray_tolerance=10, color_std_dev_threshold=5):
     
     return is_color_neutral and is_color_uniform
 
-def count_gray_mcu_scanlines(filepath, mcu_data, gray_tolerance=10, color_std_dev_threshold=5):
+def count_gray_mcu_scanlines(filepath: str, mcu_data: dict, gray_tolerance: int = 10, color_std_dev_threshold: int = 5) -> tuple[int, int, list[int]]:
     """
     (Used for Header Crop) Iterates through all vertical MCU scanlines and counts how many are gray.
     """
@@ -136,7 +140,7 @@ def count_gray_mcu_scanlines(filepath, mcu_data, gray_tolerance=10, color_std_de
         return 0, 0, []
         
         
-def analyze_last_scanline_mcus(filepath, mcu_data, gray_tolerance=10, color_std_dev_threshold=5):
+def analyze_last_scanline_mcus(filepath: str, mcu_data: dict, gray_tolerance: int = 10, color_std_dev_threshold: int = 5) -> int:
     """
     (Used for Auto Alignment) Analyzes the individual MCUs in the last vertical scanline 
     of the image to count 'Gray MCUs Found' (horizontal analysis).
@@ -183,7 +187,7 @@ def analyze_last_scanline_mcus(filepath, mcu_data, gray_tolerance=10, color_std_
 
 # --- NEW: PhotoDemon Clarity Lookup Table Generator ---
 
-def _clarity_lookup_table():
+def _clarity_lookup_table() -> np.ndarray:
     """
     Generates the PhotoDemon 'Clarity/Midtone Contrast' lookup table 
     based on the fxAutoEnhance VBA function logic.
@@ -221,6 +225,8 @@ def photodemon_autocorrect_image(img: Image.Image) -> Image.Image:
     Applies PhotoDemon's primary auto-correction steps: 
     1. Independent channel White Balance (0.05% clip - from AutoCorrectImage)
     2. Midtone Contrast/Clarity (from fxAutoEnhance)
+    
+    FIXED: Removed 'mode' parameter from Image.fromarray to fix DeprecationWarning.
     """
     
     if img.mode != 'RGB':
@@ -260,13 +266,14 @@ def photodemon_autocorrect_image(img: Image.Image) -> Image.Image:
     np_img[:, :, 1] = clarity_lookup[np_img[:, :, 1]] # Green
     np_img[:, :, 2] = clarity_lookup[np_img[:, :, 2]] # Blue
     
-    return Image.fromarray(np_img, 'RGB')
+    # FIX: Remove 'mode' parameter to eliminate DeprecationWarning
+    return Image.fromarray(np_img)
 
 # ======================================================================
 # --- CROP/HEADER MODIFICATION LOGIC ---
 # ======================================================================
 
-def find_sof_height_position(filepath):
+def find_sof_height_position(filepath: str) -> int | None:
     """
     Scans the JPEG file to find the byte position of the Height field
     within the SOF segment (0xFFC0 or 0xFFC2).
@@ -291,7 +298,7 @@ def find_sof_height_position(filepath):
     except Exception:
         return None
 
-def crop_jpeg_by_header(source_filepath, output_filepath, scanlines_to_remove):
+def crop_jpeg_by_header(source_filepath: str, output_filepath: str, scanlines_to_remove: int) -> bool:
     """
     Copies the source file and modifies the Height field in the SOF segment
     of the new file based on the number of MCU scanlines to remove.
@@ -341,7 +348,7 @@ def crop_jpeg_by_header(source_filepath, output_filepath, scanlines_to_remove):
 # --- UTILITY MCU FUNCTIONS ---
 # ======================================================================
 
-def get_mcu_avg_ycbr_values(filepath, mcu_data, r, c):
+def get_mcu_avg_ycbr_values(filepath: str, mcu_data: dict, r: int, c: int) -> list[float] | None:
     """Calculates the average Y, Cb, and Cr values for a specific MCU block."""
     if not filepath or not mcu_data: return None
 
@@ -349,13 +356,17 @@ def get_mcu_avg_ycbr_values(filepath, mcu_data, r, c):
     x_start = c * data['mcu_x']
     y_start = r * data['mcu_y']
     
-    crop_box = (x_start, y_start, x_start + data['mcu_x'], y_start + data['mcu_y'])
+    # Ensure crop box doesn't exceed image boundaries (Pillow handles this automatically, but good practice)
+    x_end = x_start + data['mcu_x']
+    y_end = y_start + data['mcu_y']
+    crop_box = (x_start, y_start, x_end, y_end)
     
     try:
         img = Image.open(filepath).convert('YCbCr')
         mcu_img = img.crop(crop_box)
         mcu_array = np.array(mcu_img)
-        avg_values = mcu_array.mean(axis=(0, 1))
+        # Calculate mean across the block (rows, then columns)
+        avg_values = mcu_array.mean(axis=(0, 1)) 
         
         return avg_values.tolist()
             
@@ -368,7 +379,7 @@ def get_mcu_avg_ycbr_values(filepath, mcu_data, r, c):
 
 class McuGridItem(QGraphicsItem):
     
-    def __init__(self, mcu_data, image_pixmap, main_window):
+    def __init__(self, mcu_data: dict, image_pixmap: QPixmap, main_window: 'MainWindow'):
         super().__init__()
         self.main_window = main_window
         self.pixmap = image_pixmap
@@ -380,7 +391,8 @@ class McuGridItem(QGraphicsItem):
         self.n_mcu_x = mcu_data['n_mcu_x']
         self.n_mcu_y = mcu_data['n_mcu_y']
 
-        self.selected_mcu_coords = (0, 0)
+        # Ensure selected_mcu_coords is initialized (0, 0)
+        self.selected_mcu_coords = (0, 0) 
         self.hovered_mcu_coords = None 
         self.grid_visible = False
         
@@ -391,14 +403,13 @@ class McuGridItem(QGraphicsItem):
 
     def boundingRect(self): return self._bounding_rect
 
-    def paint(self, painter, option, widget=None):
+    def paint(self, painter: QPainter, option, widget=None):
         painter.drawPixmap(self.boundingRect().toRect(), self.pixmap)
         
         if self.grid_visible:
             painter.setPen(QPen(QColor(255, 255, 255, 120), 0))
             for c in range(1, self.n_mcu_x):
                 painter.drawLine(c * self.mcu_x, 0, c * self.mcu_x, self.img_height)
-            # Corrected: Horizontal lines span the image width
             for r in range(1, self.n_mcu_y):
                 painter.drawLine(0, r * self.mcu_y, self.img_width, r * self.mcu_y)
             
@@ -423,7 +434,7 @@ class McuGridItem(QGraphicsItem):
             painter.setPen(QPen(QColor(0, 120, 215), 5))
             painter.drawRect(highlight_rect)
     
-    def _calculate_mcu_coords(self, pos):
+    def _calculate_mcu_coords(self, pos: QPointF) -> tuple[int, int]:
         c = int(pos.x() // self.mcu_x)
         r = int(pos.y() // self.mcu_y)
         
@@ -477,7 +488,7 @@ class McuGridItem(QGraphicsItem):
 
 class McuGraphicsView(QGraphicsView):
     
-    def __init__(self, scene, parent=None):
+    def __init__(self, scene: QGraphicsScene, parent=None):
         super().__init__(scene, parent)
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -495,7 +506,7 @@ class BlockPreviewWidget(QWidget):
     
     CELL_SIZE = 8
     
-    def __init__(self, cols=16, rows=8, is_static_preview=False, parent=None):
+    def __init__(self, cols: int = 16, rows: int = 8, is_static_preview: bool = False, parent=None):
         super().__init__(parent)
         self.rows = rows
         self.cols = cols
@@ -504,8 +515,9 @@ class BlockPreviewWidget(QWidget):
         self.is_hovered = False 
         self.mcu_pixmap = QPixmap() 
         self.setFixedSize(self.cols * self.CELL_SIZE + 2, self.rows * self.CELL_SIZE + 2) 
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed) # Ensures fixed size
 
-    def update_pixmap(self, pixmap):
+    def update_pixmap(self, pixmap: QPixmap):
         self.mcu_pixmap = pixmap.scaled(
             self.cols * self.CELL_SIZE, 
             self.rows * self.CELL_SIZE, 
@@ -545,18 +557,15 @@ class BlockPreviewWidget(QWidget):
         for c in range(self.cols + 1):
             painter.drawLine(c * self.CELL_SIZE + 1, 1, c * self.CELL_SIZE + 1, self.rows * self.CELL_SIZE + 1)
         
+        # Hover/Selection Border Logic
+        border_pen = QPen(QColor(0, 0, 0), 1) # Default
         if self.is_static_preview and self.is_hovered:
-            painter.setPen(QPen(QColor(0, 160, 255), 2)) 
-            painter.drawRect(0, 0, self.width()-1, self.height()-1)
+            border_pen = QPen(QColor(0, 160, 255), 2) 
         elif not self.is_static_preview and self.is_selected:
-            painter.setPen(QPen(QColor(255, 0, 0), 2)) 
-            painter.drawRect(0, 0, self.width()-1, self.height()-1)
-        elif self.is_static_preview:
-            painter.setPen(QPen(QColor(0, 0, 0), 1))
-            painter.drawRect(0, 0, self.width()-1, self.height()-1)
-        else:
-            painter.setPen(QPen(QColor(100, 100, 100), 1))
-            painter.drawRect(0, 0, self.width()-1, self.height()-1)
+            border_pen = QPen(QColor(255, 0, 0), 2) 
+        
+        painter.setPen(border_pen)
+        painter.drawRect(0, 0, self.width()-1, self.height()-1)
 
     def set_active_state(self, is_selected: bool):
         if self.is_selected != is_selected:
@@ -579,36 +588,42 @@ class MainWindow(QMainWindow):
         self.current_filepath = None
         self.original_filepath = None
         
-        # New variable for Auto Alignment logic (horizontal gray MCU count)
         self.post_crop_gray_mcu_count = 0 
         
         self.scene = QGraphicsScene()
         self.view = McuGraphicsView(self.scene)
         self.grid_item = None
         
+        # Initialize selected MCU coordinates
+        self.selected_mcu_c = 0 
+        self.selected_mcu_r = 0
+
         central_widget = QWidget()
         outer_layout = QHBoxLayout(central_widget)
 
-        # --- Left/Main Content Area ---
+        # --- Left/Main Content Area (Image Viewer + Controls) ---
         left_content_layout = QVBoxLayout()
         
         # --- Top Info Layout (MCU, DIMS, File) ---
         top_layout = QGridLayout()
+        
+        # Row 0: File Operations
         self.open_button = QPushButton("Open JPEG File...")
         self.open_button.clicked.connect(self.open_file)
-        top_layout.addWidget(self.open_button, 0, 0, 1, 2)
+        top_layout.addWidget(self.open_button, 0, 0, 1, 1)
         self.reset_button = QPushButton("Reset to Original")
         self.reset_button.clicked.connect(self.reset_to_original)
         self.reset_button.setEnabled(False)
-        top_layout.addWidget(self.reset_button, 0, 2, 1, 1)
+        top_layout.addWidget(self.reset_button, 0, 1, 1, 1)
         self.toggle_grid_button = QPushButton("Turn Grid On")
         self.toggle_grid_button.clicked.connect(self.toggle_grid_visibility)
         self.toggle_grid_button.setEnabled(False) 
-        top_layout.addWidget(self.toggle_grid_button, 0, 3, 1, 1)
+        top_layout.addWidget(self.toggle_grid_button, 0, 2, 1, 1)
         
+        # Row 1-4: File/Image Info
         top_layout.addWidget(QLabel("File:"), 1, 0)
         self.file_label = QLabel("No file loaded")
-        top_layout.addWidget(self.file_label, 1, 1, 1, 3)
+        top_layout.addWidget(self.file_label, 1, 1, 1, 2)
         top_layout.addWidget(QLabel("Dimensions:"), 2, 0)
         self.dim_label = QLabel("--- x ---")
         top_layout.addWidget(self.dim_label, 2, 1)
@@ -618,7 +633,7 @@ class MainWindow(QMainWindow):
 
         top_layout.addWidget(QLabel("Gray Scanlines (Vertical):"), 4, 0)
         self.gray_scanline_count_label = QLabel("--- / --- (0%)")
-        top_layout.addWidget(self.gray_scanline_count_label, 4, 1, 1, 3)
+        top_layout.addWidget(self.gray_scanline_count_label, 4, 1, 1, 2)
         
         left_content_layout.addLayout(top_layout)
         left_content_layout.addSpacing(10)
@@ -674,7 +689,6 @@ class MainWindow(QMainWindow):
         self.cdelta_button.setEnabled(False)
         color_correction_group.addWidget(self.cdelta_button)
         
-        # --- Auto Color Button (Updated Text) ---
         self.auto_color_button = QPushButton("Auto Color/Lighting Correction (PhotoDemon Logic)")
         self.auto_color_button.clicked.connect(self.run_auto_color_correction)
         self.auto_color_button.setEnabled(False)
@@ -705,7 +719,6 @@ class MainWindow(QMainWindow):
         self.remove_gray_scanlines_button.setEnabled(False)
         repair_layout.addWidget(self.remove_gray_scanlines_button, 2, 0, 1, 4) 
         
-        # --- Auto Alignment Button ---
         self.auto_align_button = QPushButton("Auto Alignment (Insert MCU)")
         self.auto_align_button.clicked.connect(self.run_auto_alignment)
         self.auto_align_button.setEnabled(False) 
@@ -713,13 +726,12 @@ class MainWindow(QMainWindow):
         
         left_content_layout.addLayout(repair_layout)
         
-        outer_layout.addLayout(left_content_layout, 1)
+        outer_layout.addLayout(left_content_layout, 1) # Give viewer space
 
-        # --- Right Panel ---
+        # --- Right Panel (Previews) ---
         right_panel_layout = QVBoxLayout()
         right_panel_layout.setAlignment(Qt.AlignmentFlag.AlignTop) 
-
-        right_panel_layout.addWidget(QLabel("Pixel block preview:"))
+        right_panel_layout.addWidget(QLabel("Pixel block preview (on hover):"))
         self.pixel_block_preview = BlockPreviewWidget(cols=16, rows=8, is_static_preview=True)
         right_panel_layout.addWidget(self.pixel_block_preview)
         right_panel_layout.addSpacing(20)
@@ -734,19 +746,22 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central_widget)
     
     # --- MCU Pixel Extraction with Pillow ---
-    def get_mcu_block_pixmap(self, r, c):
+    def get_mcu_block_pixmap(self, r: int, c: int) -> QPixmap:
         if not self.current_filepath or not self.current_mcu_data: return QPixmap()
 
         data = self.current_mcu_data
         x_start = c * data['mcu_x']
         y_start = r * data['mcu_y']
+        x_end = x_start + data['mcu_x']
+        y_end = y_start + data['mcu_y']
         
-        crop_box = (x_start, y_start, x_start + data['mcu_x'], y_start + data['mcu_y'])
+        crop_box = (x_start, y_start, x_end, y_end)
         
         try:
             img = Image.open(self.current_filepath)
             mcu_img = img.crop(crop_box)
             
+            # Convert Pillow Image to QPixmap via in-memory buffer
             buffer = QBuffer()
             buffer.open(QIODevice.OpenModeFlag.ReadWrite)
             mcu_img.save(buffer, "PNG") 
@@ -762,7 +777,7 @@ class MainWindow(QMainWindow):
 
 
     # --- Display/Feedback Methods ---
-    def display_hover_info(self, r, c):
+    def display_hover_info(self, r: int, c: int):
         mcu_pixmap = self.get_mcu_block_pixmap(r, c)
         self.pixel_block_preview.update_pixmap(mcu_pixmap)
         self.pixel_block_preview.set_hover_state(True)
@@ -771,8 +786,11 @@ class MainWindow(QMainWindow):
         self.pixel_block_preview.clear_pixmap()
         self.pixel_block_preview.set_hover_state(False)
 
-    def display_mcu_info(self, r, c):
-        if not self.current_mcu_data or not self.grid_item: return
+    def display_mcu_info(self, r: int, c: int):
+        if not self.current_mcu_data or not self.grid_item: 
+            self.clear_mcu_info()
+            return
+            
         data = self.current_mcu_data
         
         mcu_pixmap = self.get_mcu_block_pixmap(r, c)
@@ -785,6 +803,7 @@ class MainWindow(QMainWindow):
         x_start = c * data['mcu_x']
         y_start = r * data['mcu_y']
         
+        # Pixel end coordinates are inclusive
         x_end = min((c + 1) * data['mcu_x'] - 1, data['width'] - 1)
         y_end = min((r + 1) * data['mcu_y'] - 1, data['height'] - 1)
         
@@ -818,8 +837,8 @@ class MainWindow(QMainWindow):
         self.clear_hover_info()
 
 
-    # --- Image Loading Logic (Includes FIXED Scanline variable check) ---
-    def load_and_display_image(self, filepath):
+    # --- Image Loading Logic ---
+    def load_and_display_image(self, filepath: str):
         
         image_pixmap = QPixmap(filepath)
         if image_pixmap.isNull():
@@ -830,6 +849,7 @@ class MainWindow(QMainWindow):
         mcu_data = get_jpeg_mcu_data(filepath)
         
         if mcu_data:
+            # Update data with actual QPixmap dimensions (in case header reading was truncated)
             mcu_data['width'] = image_pixmap.width()
             mcu_data['height'] = image_pixmap.height()
             self.current_mcu_data = mcu_data
@@ -839,7 +859,6 @@ class MainWindow(QMainWindow):
 
             # 1. Run Vertical Gray Scanline Detection (for Header Crop)
             try:
-                # The corrected count_gray_mcu_scanlines function is used here.
                 vertical_gray_count, total_scanlines, _ = count_gray_mcu_scanlines(filepath, mcu_data)
                 
                 if total_scanlines > 0:
@@ -858,10 +877,12 @@ class MainWindow(QMainWindow):
                 horizontal_gray_mcu_count = analyze_last_scanline_mcus(filepath, mcu_data)
                 self.post_crop_gray_mcu_count = horizontal_gray_mcu_count
                 
-                # Enable Auto Alignment only if the file is a *repaired* file and gray MCUs were found horizontally.
-                is_cropped_file = (self.original_filepath is not None and filepath != self.original_filepath)
+                # Auto Alignment is only enabled if: 
+                # a) The current file is *not* the original file (i.e., a crop has already happened) AND
+                # b) Horizontal gray MCUs were found.
+                is_repaired_file = (self.original_filepath is not None and filepath != self.original_filepath)
                 
-                if is_cropped_file and horizontal_gray_mcu_count > 0:
+                if is_repaired_file and horizontal_gray_mcu_count > 0:
                     self.auto_align_button.setEnabled(True)
                 else:
                     self.auto_align_button.setEnabled(False)
@@ -881,6 +902,7 @@ class MainWindow(QMainWindow):
             self.view.fitInView(self.grid_item, Qt.AspectRatioMode.KeepAspectRatio)
             self.grid_item.setFocus(Qt.FocusReason.NoFocusReason)
             
+            # Enable controls
             self.insert_button.setEnabled(True)
             self.delete_button.setEnabled(True)
             self.reset_button.setEnabled(True) 
@@ -890,6 +912,7 @@ class MainWindow(QMainWindow):
             
             self.toggle_grid_button.setText("Turn Grid On") 
             
+            # Select and display info for MCU (0, 0)
             self.clear_mcu_info() 
             self.grid_item.mousePressEvent(self._create_fake_event()) 
         else:
@@ -909,6 +932,8 @@ class MainWindow(QMainWindow):
         self.grid_item = None
         self.clear_mcu_info()
         self.avg_ycbr_label.setText("Y: ---, Cb: ---, Cr: ---")
+        
+        # Disable controls
         self.insert_button.setEnabled(False)
         self.delete_button.setEnabled(False)
         self.reset_button.setEnabled(False)
@@ -917,11 +942,11 @@ class MainWindow(QMainWindow):
         self.remove_gray_scanlines_button.setEnabled(False) 
         self.auto_align_button.setEnabled(False) 
         self.auto_color_button.setEnabled(False) 
+        
+        # Reset Sliders
         self.y_slider.setValue(0)
         self.cb_slider.setValue(0)
         self.cr_slider.setValue(0)
-        self.selected_block_preview.set_active_state(False)
-        self.clear_hover_info()
 
     # --- Utility Methods ---
     def toggle_grid_visibility(self):
@@ -962,58 +987,51 @@ class MainWindow(QMainWindow):
         self.cr_slider.setValue(0)
 
     def _create_fake_event(self):
+        """Creates a fake mouse event for programmatically selecting the (0, 0) MCU."""
         class FakeMouseEvent:
             def button(self): return Qt.MouseButton.LeftButton
-            def pos(self): return QPointF(0, 0)
+            def pos(self): return QPointF(1, 1) # Small offset to ensure it's inside the first MCU
         return FakeMouseEvent()
     
     # ======================================================================
     # --- File Path Logic (Simplified Naming - NO COUNTER, OVERWRITE) ---
     # ======================================================================
-    def get_repair_filepaths(self, operation):
+    def get_repair_filepaths(self, operation: str) -> tuple[str, str] | tuple[None, None]:
         """
         Determines input and output file paths.
         All non-temp operations output to the original filename in the Repaired folder, enabling overwrite.
         """
-        # 1. Determine the base file path to extract directory and original name
-        # Use self.original_filepath if available, otherwise fallback to current_filepath
         base_path = self.original_filepath if self.original_filepath else self.current_filepath
         if not base_path:
             return None, None
             
-        # 2. Define the Repaired directory (always relative to the base file's directory)
         input_dir = os.path.dirname(base_path) 
         repaired_dir = os.path.join(input_dir, "Repaired")
         
         try:
-            # This ensures only one 'Repaired' folder is created per original file's location
             os.makedirs(repaired_dir, exist_ok=True)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to create Repaired directory: {e}")
             return None, None
             
-        # 3. Determine the output filename
         original_filename = os.path.basename(base_path)
         base_name_no_ext = os.path.splitext(original_filename)[0]
         ext = os.path.splitext(original_filename)[1]
         
         if operation.startswith("temp_cdelta"):
-            # For temporary/intermediate cdelta files, keep a descriptive name. 
+            # Temporary files for multi-step cdelta operation
             output_filename = f"{base_name_no_ext}_{operation.replace(' ', '_')}{ext}"
         else:
-            # For all final repairs (autowb, cdelta, insert, delete, header_crop, auto_align_insert)
-            # Use the original file name, resulting in overwrite inside the Repaired folder.
+            # All final repairs use the original name (e.g., file.jpg) in the Repaired folder
             output_filename = original_filename
 
         output_file = os.path.join(repaired_dir, output_filename)
-        
-        # The input file for the operation is always the currently loaded file
         input_file = self.current_filepath
         
         return input_file, output_file
     # ======================================================================
 
-    def execute_jpegrepair(self, command, operation):
+    def execute_jpegrepair(self, command: list[str], operation: str) -> tuple[bool, str]:
         script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
         exe_path = os.path.join(script_dir, "jpegrepair.exe")
 
@@ -1029,6 +1047,10 @@ class MainWindow(QMainWindow):
                 return True, ""
             else:
                 error_output = process.stderr if process.stderr else "No specific error output."
+                # Check for "Invalid SOS parameters" to inform the user what caused the jpegrepair failure.
+                if "Invalid SOS parameters" in process.stderr or "Invalid SOS parameters" in process.stdout:
+                    error_output += "\n\n(Note: The tool reported 'Invalid SOS parameters' which usually means the JPEG stream is structurally corrupted. This often prevents further operations.)"
+                
                 return False, f"Execution failed for {operation} with return code {process.returncode}.\nError:\n{error_output}"
 
         except Exception as e:
@@ -1042,6 +1064,7 @@ class MainWindow(QMainWindow):
 
         try:
             # Parse the scanlines to remove from the current label text (vertical count)
+            # The label is formatted as "COUNT / TOTAL (PERCENT%)"
             label_text = self.gray_scanline_count_label.text().split('/')[0].strip()
             scanlines_to_remove = int(label_text)
         except:
@@ -1052,7 +1075,6 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Info", "Zero gray MCU scanlines found. No cropping performed.")
             return
             
-        # Output will be Repaired/original_name.ext
         input_file, output_file = self.get_repair_filepaths("header_crop") 
         if not input_file: return
         
@@ -1069,9 +1091,8 @@ class MainWindow(QMainWindow):
                 f"Successfully cropped {scanlines_to_remove} gray MCU scanlines from the bottom by modifying the JPEG header.\nOutput saved to:\n{os.path.basename(output_file)}\n\nReloading view."
             )
             self.current_filepath = output_file
-            self.load_and_display_image(output_file) # This reloads and performs the horizontal check
-
-            # Check the state set by load_and_display_image
+            self.load_and_display_image(output_file) 
+            
             if self.auto_align_button.isEnabled():
                 QMessageBox.warning(self, "Post-Crop Check", f"{self.post_crop_gray_mcu_count} gray MCUs remaining in the last scanline. **Auto Alignment enabled.**")
             else:
@@ -1104,7 +1125,7 @@ class MainWindow(QMainWindow):
             self.auto_align_button.setEnabled(False)
             return
 
-        operation = "auto_align_insert" # Output will be Repaired/original_name.ext
+        operation = "auto_align_insert" 
         
         # Insertion point must be (0, 0) for header alignment
         c = 0
@@ -1113,7 +1134,6 @@ class MainWindow(QMainWindow):
         input_file, output_file = self.get_repair_filepaths(operation) 
         if not input_file: return
         
-        # Pre-fill MCU Block Number input for user awareness
         self.mcu_block_num_input.setText(str(mcu_block_num))
         
         command = [
@@ -1122,7 +1142,7 @@ class MainWindow(QMainWindow):
             "dest",
             str(c), 
             str(r),
-            "insert", # jpegrepair command must be "insert"
+            "insert", 
             str(mcu_block_num)
         ]
         
@@ -1141,35 +1161,29 @@ class MainWindow(QMainWindow):
             self.auto_align_button.setEnabled(False) 
         else:
             QMessageBox.critical(self, "Auto Alignment Failed", error_msg)
-            self.auto_align_button.setEnabled(True) 
             
-    # --- NEW: Auto Color Correction Method (replaces AWB) ---
+    # --- Auto Color Correction Method (replaces AWB) ---
     def run_auto_color_correction(self):
         if not self.current_filepath:
             QMessageBox.warning(self, "Warning", "Please load a JPEG file first.")
             return
 
-        # Prepare output file path (Repaired/original_name.ext)
         input_file, output_file = self.get_repair_filepaths("autowb") 
         if not input_file: return
 
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         
+        success = False
+        error_msg = ""
+        
         try:
-            # 1. Open image (Pillow handles the decode)
             original_img = Image.open(input_file)
-            
-            # 2. Apply the combined PhotoDemon Auto-Correction
             corrected_img = photodemon_autocorrect_image(original_img)
-            
-            # 3. Save the corrected image to the new file path
+            # Use high quality when saving as JPEG
             corrected_img.save(output_file, quality=95, optimize=True)
-            
             success = True
             
         except Exception as e:
-            success = False
-            # Provide a specific, user-friendly error message for the GUI
             error_msg = f"Failed to apply PhotoDemon Auto-Correction (WB/Clarity).\nError details: {e}"
             
         QApplication.restoreOverrideCursor()
@@ -1180,11 +1194,9 @@ class MainWindow(QMainWindow):
                 "Auto-Correction Success", 
                 f"PhotoDemon Auto Color/Lighting Correction applied (WB + Clarity).\nOutput saved to:\n{os.path.basename(output_file)}\n\nReloading view."
             )
-            # Update current file path and reload the GUI
             self.current_filepath = output_file
             self.load_and_display_image(output_file)
             
-            # Reset cdelta sliders as this operation is complete and independent
             self.y_slider.setValue(0)
             self.cb_slider.setValue(0)
             self.cr_slider.setValue(0)
@@ -1208,12 +1220,9 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Info", "All color corrections are set to 0. No operation executed.")
             return
 
-        # 1. Get the final output file path (Repaired/original_name.ext)
-        # The input file returned here is self.current_filepath
         _, final_output_file = self.get_repair_filepaths("cdelta") 
         if not final_output_file: return
         
-        # 2. Determine the order of execution and which one is the last.
         active_components = [i for i, v in deltas.items() if v != 0]
 
         current_input_file = self.current_filepath
@@ -1222,14 +1231,14 @@ class MainWindow(QMainWindow):
         all_successful = True
         failed_messages = []
 
+        # Execute component corrections sequentially
         for comp_index in active_components:
             value = deltas[comp_index]
             is_last_component = (comp_index == active_components[-1])
             
             if is_last_component:
-                temp_output_file = final_output_file # Saves to Repaired/original_name.ext
+                temp_output_file = final_output_file 
             else:
-                # Saves to Repaired/original_name_temp_cdelta_X.ext
                 _, temp_output_file = self.get_repair_filepaths(f"temp_cdelta_{comp_index}")
                 
             operation = f"cdelta {comp_index} {value}"
@@ -1252,7 +1261,15 @@ class MainWindow(QMainWindow):
                 failed_messages.append(error_msg)
                 break 
 
-            current_input_file = temp_output_file # Input for the next step is the output of the current step
+            current_input_file = temp_output_file # Input for the next step
+
+            # Clean up temporary files (optional, but good practice)
+            if not is_last_component and os.path.exists(temp_output_file):
+                 try:
+                     os.remove(temp_output_file)
+                 except Exception:
+                     # Ignore cleanup errors
+                     pass
         
         QApplication.restoreOverrideCursor()
 
@@ -1262,7 +1279,6 @@ class MainWindow(QMainWindow):
                 "Success", 
                 f"Color Correction (cdelta) completed. Output saved to:\n{os.path.basename(final_output_file)}\n\nReloading view with the repaired image."
             )
-            # Ensure the final file is the one loaded
             self.current_filepath = final_output_file 
             self.load_and_display_image(final_output_file)
             
@@ -1274,7 +1290,7 @@ class MainWindow(QMainWindow):
             )
 
     # --- Run Insert/Delete MCU Method ---
-    def run_repair(self, operation):
+    def run_repair(self, operation: str):
         if not self.current_filepath:
             QMessageBox.warning(self, "Warning", "Please load a JPEG file first.")
             return
@@ -1287,10 +1303,10 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", "MCU Block Number must be a positive integer.")
             return
 
-        c = getattr(self, 'selected_mcu_c', 0)
-        r = getattr(self, 'selected_mcu_r', 0)
+        # Get selected MCU coordinates
+        c = self.selected_mcu_c
+        r = self.selected_mcu_r
         
-        # Output will be Repaired/original_name.ext
         input_file, output_file = self.get_repair_filepaths(operation)
         if not input_file: return
         
@@ -1300,7 +1316,7 @@ class MainWindow(QMainWindow):
             "dest",
             str(c), 
             str(r),
-            operation,
+            operation, # "insert" or "delete"
             str(mcu_block_num)
         ]
         
