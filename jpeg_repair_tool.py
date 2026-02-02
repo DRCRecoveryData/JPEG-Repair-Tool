@@ -582,7 +582,7 @@ class BlockPreviewWidget(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("JPEG MCU Repair & Alignment Tool (Modern UI)")
+        self.setWindowTitle("JPEG MCU Repair Tool")
         self.setGeometry(100, 100, 1200, 800) 
         self.current_mcu_data = None
         self.current_filepath = None
@@ -609,21 +609,21 @@ class MainWindow(QMainWindow):
         right_panel_widget.setObjectName("RightPanel") 
         
         # 1. Project Management
-        project_management_group = QGroupBox("Project Management")
+        project_management_group = QGroupBox("File Management")
         pm_layout = QVBoxLayout()
         pm_layout.setContentsMargins(10, 20, 10, 10)
 
-        self.open_button = QPushButton("Open JPEG File...")
+        self.open_button = QPushButton("Open")
         self.open_button.setObjectName("PrimaryButton")
         self.open_button.clicked.connect(self.open_file)
         pm_layout.addWidget(self.open_button)
 
-        self.reset_button = QPushButton("Reset to Original")
+        self.reset_button = QPushButton("Reset")
         self.reset_button.clicked.connect(self.reset_to_original)
         self.reset_button.setEnabled(False)
         pm_layout.addWidget(self.reset_button)
 
-        self.toggle_grid_button = QPushButton("Show MCU Grid")
+        self.toggle_grid_button = QPushButton("Show grid")
         self.toggle_grid_button.clicked.connect(self.toggle_grid_visibility)
         self.toggle_grid_button.setEnabled(False) 
         pm_layout.addWidget(self.toggle_grid_button)
@@ -647,8 +647,8 @@ class MainWindow(QMainWindow):
         mcu_previews_group = QGroupBox("MCU Previews")
         previews_layout = QGridLayout()
         previews_layout.setContentsMargins(10, 20, 10, 10)
-        previews_layout.addWidget(QLabel("HOVERED"), 0, 0, alignment=Qt.AlignmentFlag.AlignCenter)
-        previews_layout.addWidget(QLabel("SELECTED"), 0, 1, alignment=Qt.AlignmentFlag.AlignCenter)
+        previews_layout.addWidget(QLabel("Active Block"), 0, 0, alignment=Qt.AlignmentFlag.AlignCenter)
+        previews_layout.addWidget(QLabel("Target Block"), 0, 1, alignment=Qt.AlignmentFlag.AlignCenter)
 
         self.pixel_block_preview = BlockPreviewWidget(cols=16, rows=8, is_static_preview=True)
         self.selected_block_preview = BlockPreviewWidget(cols=16, rows=8, is_static_preview=False) 
@@ -661,17 +661,17 @@ class MainWindow(QMainWindow):
         
         # 3. Tab Widget for Repair/Color Correction
         
-        # --- Repair/Alignment Tab ---
+        # --- Repair Tab ---
         repair_tab = QWidget()
         repair_layout = QVBoxLayout(repair_tab)
         repair_layout.setContentsMargins(0, 0, 0, 0) 
         
-        # MCU Repair/Alignment
-        mcu_repair_group = QGroupBox("MCU Repair/Alignment")
+        # MCU Repair
+        mcu_repair_group = QGroupBox("MCU Edit")
         mcu_repair_layout = QGridLayout()
         mcu_repair_layout.setContentsMargins(10, 20, 10, 10)
         
-        mcu_repair_layout.addWidget(QLabel("MCU Block Number (k):"), 0, 0)
+        mcu_repair_layout.addWidget(QLabel("MCU Block:"), 0, 0)
         
         self.mcu_block_num_input = QSpinBox() 
         self.mcu_block_num_input.setRange(1, 1000) 
@@ -693,12 +693,12 @@ class MainWindow(QMainWindow):
         self.gray_scanline_count_label_mini = QLabel("--- / --- (0%)")
         mcu_repair_layout.addWidget(self.gray_scanline_count_label_mini, 1, 1, 1, 3)
 
-        self.execute_header_crop_button = QPushButton("Execute Header Crop (Remove All Gray Scanlines)")
+        self.execute_header_crop_button = QPushButton("Remove MCU Gray Scanlines")
         self.execute_header_crop_button.clicked.connect(self.remove_gray_scanlines)
         self.execute_header_crop_button.setEnabled(False)
         mcu_repair_layout.addWidget(self.execute_header_crop_button, 2, 0, 1, 4) 
         
-        self.auto_align_button = QPushButton("Auto Alignment (Insert Blocks at Header)")
+        self.auto_align_button = QPushButton("Auto Alignment")
         self.auto_align_button.clicked.connect(self.run_auto_alignment)
         self.auto_align_button.setEnabled(False) 
         mcu_repair_layout.addWidget(self.auto_align_button, 3, 0, 1, 4) 
@@ -714,7 +714,7 @@ class MainWindow(QMainWindow):
         color_layout.setContentsMargins(0, 0, 0, 0) 
         
         # Manual Color Adjustment
-        manual_color_group = QGroupBox("Manual Color Component Adjustment (cdelta)")
+        manual_color_group = QGroupBox("Manual Color")
         manual_color_layout = QVBoxLayout()
         manual_color_layout.setContentsMargins(10, 20, 10, 10)
         MIN_VAL, MAX_VAL, DEFAULT_VAL = -2047, 2047, 0
@@ -744,7 +744,7 @@ class MainWindow(QMainWindow):
         self.cr_slider, cr_layout = create_slider("Cr")
         manual_color_layout.addLayout(cr_layout)
         
-        self.cdelta_button = QPushButton("Apply CDelta Adjustments")
+        self.cdelta_button = QPushButton("Apply")
         self.cdelta_button.setObjectName("SecondaryButton")
         self.cdelta_button.clicked.connect(self.run_cdelta_repair)
         self.cdelta_button.setEnabled(False)
@@ -754,11 +754,11 @@ class MainWindow(QMainWindow):
         color_layout.addWidget(manual_color_group)
 
         # Automatic Color Correction
-        auto_color_group = QGroupBox("Automatic Color Correction")
+        auto_color_group = QGroupBox("Auto color")
         auto_color_layout = QVBoxLayout()
         auto_color_layout.setContentsMargins(10, 20, 10, 10)
         
-        self.auto_color_button = QPushButton("Apply PhotoDemon WB + Clarity")
+        self.auto_color_button = QPushButton("Apply")
         self.auto_color_button.setObjectName("AccentButton") 
         self.auto_color_button.clicked.connect(self.run_auto_color_correction)
         self.auto_color_button.setEnabled(False)
@@ -773,11 +773,11 @@ class MainWindow(QMainWindow):
         batch_layout = QVBoxLayout(batch_tab)
         batch_layout.setContentsMargins(10, 10, 10, 10)
         
-        batch_group = QGroupBox("Auto Batch Process (Reference Header Merge)")
+        batch_group = QGroupBox("Batch")
         batch_grid = QGridLayout()
         
         # 1. Reference JPEG Path
-        batch_grid.addWidget(QLabel("Reference JPEG Path:"), 0, 0)
+        batch_grid.addWidget(QLabel("Reference JPEG:"), 0, 0)
         self.reference_jpeg_input = QLineEdit()
         self.reference_jpeg_input.setPlaceholderText("Select a known good JPEG file...")
         batch_grid.addWidget(self.reference_jpeg_input, 0, 1)
@@ -786,7 +786,7 @@ class MainWindow(QMainWindow):
         batch_grid.addWidget(self.select_ref_button, 0, 2)
         
         # 2. Encrypted Folder Path
-        batch_grid.addWidget(QLabel("Encrypted Folder Path:"), 1, 0)
+        batch_grid.addWidget(QLabel("Encrypted Folder:"), 1, 0)
         self.encrypted_folder_input = QLineEdit()
         self.encrypted_folder_input.setPlaceholderText("Select folder containing encrypted files...")
         batch_grid.addWidget(self.encrypted_folder_input, 1, 1)
@@ -795,7 +795,7 @@ class MainWindow(QMainWindow):
         batch_grid.addWidget(self.select_folder_button, 1, 2)
         
         # 3. Process Button
-        self.auto_batch_process_button = QPushButton("Start Auto Batch Process")
+        self.auto_batch_process_button = QPushButton("Start")
         self.auto_batch_process_button.setObjectName("PrimaryButton")
         self.auto_batch_process_button.clicked.connect(self.repairJPEGs)
         batch_grid.addWidget(self.auto_batch_process_button, 2, 0, 1, 3)
@@ -810,35 +810,35 @@ class MainWindow(QMainWindow):
         self.output_text = QTextEdit()
         self.output_text.setReadOnly(True)
         self.output_text.setObjectName("OutputText")
-        batch_layout.addWidget(QLabel("Batch Log:"))
+        batch_layout.addWidget(QLabel("Log:"))
         batch_layout.addWidget(self.output_text, 1)
         
         # Tab Widget container
         self.tab_widget = QTabWidget()
-        self.tab_widget.addTab(repair_tab, "Repair/Alignment")
-        self.tab_widget.addTab(color_tab, "Color Correction")
-        self.tab_widget.addTab(batch_tab, "Batch Processing") # ADDED BATCH TAB
+        self.tab_widget.addTab(repair_tab, "Repair")
+        self.tab_widget.addTab(color_tab, "Color")
+        self.tab_widget.addTab(batch_tab, "Batch") # ADDED BATCH TAB
         
         right_panel_layout.addWidget(self.tab_widget)
         
         # 4. Selected MCU Information
-        selection_info_group = QGroupBox("Selected MCU Information")
+        selection_info_group = QGroupBox("MCU Info")
         selection_layout = QGridLayout()
         selection_layout.setContentsMargins(10, 20, 10, 10)
         
-        selection_layout.addWidget(QLabel("MCU Coords (Col, Row):"), 0, 0)
+        selection_layout.addWidget(QLabel("MCU Address:"), 0, 0)
         self.mcu_coords_label = QLabel("--")
         selection_layout.addWidget(self.mcu_coords_label, 0, 1)
         
-        selection_layout.addWidget(QLabel("MCU Index (1-based):"), 1, 0)
+        selection_layout.addWidget(QLabel("MCU Index:"), 1, 0)
         self.mcu_index_label = QLabel("--")
         selection_layout.addWidget(self.mcu_index_label, 1, 1)
         
-        selection_layout.addWidget(QLabel("Pixel Position Range:"), 2, 0)
+        selection_layout.addWidget(QLabel("Pixel Position:"), 2, 0)
         self.pixel_range_label = QLabel("X: ---, Y: ---")
         selection_layout.addWidget(self.pixel_range_label, 2, 1, 1, 3)
 
-        selection_layout.addWidget(QLabel("Avg YCbCr:"), 3, 0) 
+        selection_layout.addWidget(QLabel("YCbCr:"), 3, 0) 
         self.avg_ycbr_label = QLabel("Y: ---, Cb: ---, Cr: ---") 
         selection_layout.addWidget(self.avg_ycbr_label, 3, 1, 1, 3) 
         
@@ -1215,13 +1215,13 @@ class MainWindow(QMainWindow):
                     self.auto_align_button.setText(f"Auto Alignment (Insert {insert_blocks} Blocks at Header)")
                 else:
                     self.auto_align_button.setEnabled(False)
-                    self.auto_align_button.setText("Auto Alignment (Insert Blocks at Header)")
+                    self.auto_align_button.setText("Auto Alignment")
 
 
             except Exception as e:
                 self.post_crop_gray_mcu_count = 0
                 self.auto_align_button.setEnabled(False)
-                self.auto_align_button.setText("Auto Alignment (Insert Blocks at Header)")
+                self.auto_align_button.setText("Auto Alignment")
                 print(f"Error during auto alignment analysis: {e}", file=sys.stderr)
 
 
@@ -1257,7 +1257,7 @@ class MainWindow(QMainWindow):
         self.dim_label_mini.setText("--- x ---")
         self.mcu_label_mini.setText("--- x ---")
         self.gray_scanline_count_label_mini.setText("--- / --- (0%)") 
-        self.auto_align_button.setText("Auto Alignment (Insert Blocks at Header)")
+        self.auto_align_button.setText("Auto Alignment")
         self.post_crop_gray_mcu_count = 0 
         self.vertical_gray_scanlines_to_remove = 0 
         
@@ -1705,7 +1705,7 @@ class MainWindow(QMainWindow):
     # --- Internal Batch Repair Helpers ---
 
     def _batch_step_header_crop(self, input_path, output_path):
-        """1. Execute Header Crop (Remove All Gray Scanlines) - Batch Version"""
+        """1. Remove MCU Gray Scanlines - Batch Version"""
         mcu_data = get_jpeg_mcu_data(input_path)
         if not mcu_data: return False, f"Error: Cannot read MCU data from {os.path.basename(input_path)}."
 
