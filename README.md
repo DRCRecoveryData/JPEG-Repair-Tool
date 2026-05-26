@@ -17,7 +17,7 @@ The tool works by intelligently determining and applying the correct **Minimum C
 
 | Before Repair | After Repair |
 | :---: | :---: |
-| ![Corrupted JPEG Image](https://github.com/user-attachments/assets/b971b10d-408e-4337-b2b4-b028b8b7624a) | ![Repaired JPEG Image](https://github.com/user-attachments/assets/3e1d8365-e93e-4345-b4e6-34648dfe5604) |
+| <img width="1920" height="1032" alt="{BA098978-B21C-47ED-846F-47DE6A4E06F2}" src="https://github.com/user-attachments/assets/cf0e7ead-44e2-49ae-9475-c80bae16c4f7" /> | <img width="1920" height="1032" alt="{3739E18E-09AE-48C0-BA6D-63ADB3BB303D}" src="https://github.com/user-attachments/assets/54b7ef7f-72f0-4ca6-8178-ac86e64ae57f" /> |
 
 
 ---
