@@ -2359,8 +2359,8 @@ class MainWindow(QMainWindow):
             return None, None
             
         original_filename = os.path.basename(base_path)
-        output_file = os.path.join(repaired_dir, original_filename)
-        input_file = self.current_filepath
+        output_file = os.path.normpath(os.path.abspath(os.path.join(repaired_dir, original_filename)))
+        input_file = os.path.normpath(os.path.abspath(self.current_filepath))
         
         return input_file, output_file
 
