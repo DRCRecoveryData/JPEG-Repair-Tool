@@ -4,14 +4,20 @@ import os
 import subprocess
 import shutil
 import numpy as np
-import re
+import re # ADDED: For file pattern matching in batch process
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, 
     QGridLayout, QLabel, QPushButton, QFileDialog,
     QMessageBox, QGraphicsView, QGraphicsScene, QGraphicsItem,
     QLineEdit, QHBoxLayout, QSlider, QFrame, QGroupBox, QTabWidget,
-    QSpinBox, QTextEdit, QProgressBar, QScrollArea, QMenu, QDialog, 
-    QListWidget, QTableWidget, QTableWidgetItem, QHeaderView
+    QSpinBox, # ADDED: QSpinBox
+    QTextEdit, # ADDED: For batch process log
+    QProgressBar, # ADDED: For batch process progress
+    QScrollArea, # ADDED: For scrolling sidebar
+    QMenu, # ADDED: For context menu
+    QDialog, # ADDED: For hex viewer dialog
+    QListWidget, # ADDED: For hex viewer marker list
+    QTableWidget, QTableWidgetItem, QHeaderView # ADDED: For exif metadata inspector
 )
 from PyQt6.QtGui import QPainter, QColor, QPen, QPixmap, QPalette, QMouseEvent, QFont, QImage, QAction
 from PyQt6.QtCore import Qt, QRectF, QRect, QPointF, QBuffer, QIODevice
@@ -29,7 +35,7 @@ except ImportError:
 
 
 # ======================================================================
-# --- JPEG HEADER & SCANLINE LOGIC ---
+# --- JPEG HEADER & SCANLINE LOGIC (Utility functions remain the same) ---
 # ======================================================================
 
 def get_jpeg_mcu_data(filepath):
@@ -43,6 +49,7 @@ def get_jpeg_mcu_data(filepath):
                 marker = f.read(2)
                 if not marker: return None
                 
+                # Check for SOF0 (Baseline DCT) or SOF2 (Progressive DCT)
                 if marker in (b'\xff\xc0', b'\xff\xc2'):
                     length_bytes = f.read(2)
                     if len(length_bytes) < 2: return None
@@ -53,6 +60,7 @@ def get_jpeg_mcu_data(filepath):
                     if len(sof_data) != (segment_length - 2): return None
                     break
                 
+                # Skip other markers (0xFFXX where XX is not D8, D9, DA)
                 if marker[0] == 0xff and marker[1] not in (0x00, 0xd8, 0xd9, 0xda):
                     segment_length = struct.unpack('>H', f.read(2))[0]
                     f.seek(segment_length - 2, 1)
@@ -60,17 +68,23 @@ def get_jpeg_mcu_data(filepath):
                 else: f.seek(-1, 1)
 
             height_y, width_x = struct.unpack('>HH', sof_data[1:5])
+            
+            # Simplified component check for common YCbCr 4:2:0/4:4:4
             num_components = sof_data[5]
 
+            # Assume 3 components (Y, Cb, Cr)
             if num_components != 3: return None
             
+            # Read Y component sampling factor byte (index 7 from SOF data)
             y_sampling_factor_byte = sof_data[7]
             y_hor = (y_sampling_factor_byte >> 4) & 0x0F
             y_ver = y_sampling_factor_byte & 0x0F
             
+            # MCU size in pixels
             mcu_x = y_hor * 8
             mcu_y = y_ver * 8
             
+            # Number of MCUs required to cover the width/height
             n_mcu_x = (width_x + mcu_x - 1) // mcu_x
             n_mcu_y = (height_y + mcu_y - 1) // mcu_y
             
@@ -83,13 +97,17 @@ def get_jpeg_mcu_data(filepath):
         return None
 
 def is_mcu_scanline_gray(pixels, gray_tolerance=10, color_std_dev_threshold=5):
-    """Checks if a 2D array of YCbCr pixels is gray using NumPy."""
+    """
+    Checks if a 2D array of YCbCr pixels (whether full scanline or single MCU) is gray using NumPy.
+    """
     if pixels.size == 0:
         return False
 
+    # Check the Cb and Cr components (indices 1 and 2)
     Cb = pixels[:, 1]
     Cr = pixels[:, 2]
 
+    # Chrominance Neutrality Check: Max deviation from 128 (neutral)
     cb_deviation = np.abs(Cb.astype(int) - 128)
     cr_deviation = np.abs(Cr.astype(int) - 128)
     
@@ -97,14 +115,19 @@ def is_mcu_scanline_gray(pixels, gray_tolerance=10, color_std_dev_threshold=5):
     max_cr_dev = np.max(cr_deviation)
     is_color_neutral = (max_cb_dev <= gray_tolerance) and (max_cr_dev <= gray_tolerance)
     
+    # Chrominance Uniformity Check: Low standard deviation
     std_cb = np.std(Cb)
     std_cr = np.std(Cr)
     is_color_uniform = (std_cb <= color_std_dev_threshold) and (std_cr <= color_std_dev_threshold)
     
     return is_color_neutral and is_color_uniform
 
+# --- FIXED: Iterates backward to find contiguous gray blocks at the footer ---
 def count_gray_mcu_scanlines(filepath, mcu_data, gray_tolerance=10, color_std_dev_threshold=5, skip_top_scanlines=1):
-    """Counts contiguous gray MCU scanlines from the bottom of the image."""
+    """
+    Counts contiguous gray MCU scanlines from the bottom of the image.
+    Skips the first 'skip_top_scanlines' scanlines to avoid false positives at the top.
+    """
     if not mcu_data:
         return 0, 0, []
 
@@ -118,6 +141,7 @@ def count_gray_mcu_scanlines(filepath, mcu_data, gray_tolerance=10, color_std_de
         gray_scanline_count = 0
         gray_scanline_indices = []
 
+        # Iterate backward through MCU scanlines, skipping the top ones
         for i in range(total_mcu_scanlines - 1, skip_top_scanlines - 1, -1):
             start_row = i * mcu_y
             end_row = min((i + 1) * mcu_y, height)
@@ -127,18 +151,24 @@ def count_gray_mcu_scanlines(filepath, mcu_data, gray_tolerance=10, color_std_de
 
             if is_mcu_scanline_gray(pixels, gray_tolerance, color_std_dev_threshold):
                 gray_scanline_count += 1
-                gray_scanline_indices.insert(0, i)
+                gray_scanline_indices.insert(0, i)  # Keep indices in ascending order
             else:
+                # Stop when encountering the first non-gray scanline from the bottom
                 break
 
         return gray_scanline_count, total_mcu_scanlines, gray_scanline_indices
 
     except Exception as e:
+        # If an error occurs, return 0 and log the error
         print(f"Error in count_gray_mcu_scanlines: {e}")
         return 0, 0, []
         
+        
 def analyze_last_scanline_mcus(filepath, mcu_data, gray_tolerance=10, color_std_dev_threshold=5):
-    """Analyzes the individual MCUs in the last vertical scanline of the image."""
+    """
+    (Used for Auto Alignment) Analyzes the individual MCUs in the last vertical scanline 
+    of the image to count 'Gray MCUs Found' (horizontal analysis).
+    """
     if not mcu_data:
         return 0
 
@@ -161,13 +191,16 @@ def analyze_last_scanline_mcus(filepath, mcu_data, gray_tolerance=10, color_std_
 
         gray_mcu_count = 0
 
+        # Iterate horizontally across MCUs in the last scanline
         for i in range(n_mcu_x):
             start_col = i * mcu_x
             end_col = min((i + 1) * mcu_x, width)
 
+            # Extract the current MCU block
             mcu_block = img_array[start_row:end_row, start_col:end_col, :]
             pixels = mcu_block.reshape(-1, 3)
 
+            # Check if the MCU block is gray
             if is_mcu_scanline_gray(pixels, gray_tolerance, color_std_dev_threshold):
                 gray_mcu_count += 1
                 
@@ -175,6 +208,8 @@ def analyze_last_scanline_mcus(filepath, mcu_data, gray_tolerance=10, color_std_
         
     except Exception:
         return 0
+
+# --- PhotoDemon Clarity Lookup Table Generator ---
 
 def _clarity_lookup_table():
     """Generates the PhotoDemon 'Clarity/Midtone Contrast' lookup table."""
@@ -191,18 +226,24 @@ def _clarity_lookup_table():
             push = ((255.0 - x_float) / 127.0) * (diff / 2.0) * factor
             
         gray = x_float + push
+        
+        # Crop the lookup value to [0, 255] range
         gray = np.clip(gray, 0, 255)
+            
         contrastLookup[x] = int(round(gray))
         
     return contrastLookup
 
+# --- Combined PhotoDemon Auto-Correction Logic (WB + Clarity) ---
 def photodemon_autocorrect_image(img: Image.Image) -> Image.Image:
     """Applies PhotoDemon's primary auto-correction steps: WB and Midtone Contrast."""
+    
     if img.mode != 'RGB':
         img = img.convert('RGB')
         
     np_img = np.array(img, dtype=np.uint8)
     
+    # 1. White Balance (Independent Channel Histogram Stretch, 0.05% threshold)
     r, g, b = np_img[:, :, 0], np_img[:, :, 1], np_img[:, :, 2]
     low_clip = 0.05
     high_clip = 100.0 - 0.05
@@ -223,10 +264,13 @@ def photodemon_autocorrect_image(img: Image.Image) -> Image.Image:
         
     np_img = np.stack(corrected_channels, axis=2)
     
+    # 2. Clarity/Midtone Contrast (Lookup Table Application)
     clarity_lookup = _clarity_lookup_table()
-    np_img[:, :, 0] = clarity_lookup[np_img[:, :, 0]]
-    np_img[:, :, 1] = clarity_lookup[np_img[:, :, 1]]
-    np_img[:, :, 2] = clarity_lookup[np_img[:, :, 2]]
+    
+    # Apply lookup table to all channels
+    np_img[:, :, 0] = clarity_lookup[np_img[:, :, 0]] # Red
+    np_img[:, :, 1] = clarity_lookup[np_img[:, :, 1]] # Green
+    np_img[:, :, 2] = clarity_lookup[np_img[:, :, 2]] # Blue
     
     return Image.fromarray(np_img, 'RGB')
 
@@ -235,7 +279,10 @@ def photodemon_autocorrect_image(img: Image.Image) -> Image.Image:
 # ======================================================================
 
 def find_sof_height_position(filepath):
-    """Scans the JPEG file to find the byte position of the Height field."""
+    """
+    Scans the JPEG file to find the byte position of the Height field
+    within the SOF segment (0xFFC0 or 0xFFC2).
+    """
     if not os.path.exists(filepath): return None
     
     try:
@@ -246,6 +293,8 @@ def find_sof_height_position(filepath):
                 if not marker: return None
                 
                 if marker in (b'\xff\xc0', b'\xff\xc2'):
+                    # The height field is 5 bytes after the SOF marker
+                    # 2 bytes for marker, 2 bytes for length, 1 byte for precision
                     return marker_pos + 5 
                 
                 if marker[0] == 0xff and marker[1] not in (0x00, 0xd8, 0xd9, 0xda):
@@ -257,7 +306,10 @@ def find_sof_height_position(filepath):
         return None
 
 def crop_jpeg_by_header(source_filepath, output_filepath, scanlines_to_remove):
-    """Copies the source file and modifies the Height field in the SOF segment."""
+    """
+    Copies the source file and modifies the Height field in the SOF segment
+    of the new file based on the number of MCU scanlines to remove.
+    """
     mcu_data = get_jpeg_mcu_data(source_filepath)
 
     if not mcu_data:
@@ -271,7 +323,7 @@ def crop_jpeg_by_header(source_filepath, output_filepath, scanlines_to_remove):
     calculated_new_height = original_height - pixels_to_remove
     
     if calculated_new_height <= 0 or calculated_new_height >= original_height:
-        print(f"Error: Invalid crop. New height ({calculated_new_height}) is not smaller than original or is zero/negative.", file=sys.stderr)
+        print(f"Error: Invalid crop. New height ({calculated_new_height}) is not smaller than original or is zero/negative. Aborting.", file=sys.stderr)
         return False
 
     try:
@@ -297,6 +349,7 @@ def crop_jpeg_by_header(source_filepath, output_filepath, scanlines_to_remove):
     except Exception as e:
         print(f"An error occurred during header modification of the new file: {e}", file=sys.stderr)
         return False
+
 
 # ======================================================================
 # --- UTILITY MCU FUNCTIONS ---
@@ -328,6 +381,7 @@ def get_mcu_avg_ycbr_values(filepath, mcu_data, r, c):
 # ======================================================================
 
 class McuGridItem(QGraphicsItem):
+    # (Unchanged)
     def __init__(self, mcu_data, image_pixmap, main_window):
         super().__init__()
         self.main_window = main_window
@@ -436,6 +490,7 @@ class McuGridItem(QGraphicsItem):
             self.main_window.display_mcu_info(new_r, new_c)
 
 class McuGraphicsView(QGraphicsView):
+    # (Unchanged)
     def __init__(self, scene, parent=None):
         super().__init__(scene, parent)
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
@@ -450,10 +505,13 @@ class McuGraphicsView(QGraphicsView):
         else:
             self.scale(1.0 / zoom_factor, 1.0 / zoom_factor)
 
+
 class BlockPreviewWidget(QWidget):
+    
     def __init__(self, cols=16, rows=8, is_static_preview=False, parent=None):
         super().__init__(parent)
         
+        # Scale cell size dynamically for High-DPI screens
         logical_dpi = QApplication.primaryScreen().logicalDotsPerInch()
         dpi_scale = logical_dpi / 96.0
         self.CELL_SIZE = int(8 * dpi_scale)
@@ -530,6 +588,7 @@ class BlockPreviewWidget(QWidget):
             self.is_hovered = is_hovered
             self.update()
 
+
 # ======================================================================
 # --- Hex Viewer Components ---
 # ======================================================================
@@ -548,6 +607,7 @@ def scan_jpeg_markers(filepath):
             if data[i] == 0xFF:
                 marker_type = data[i+1]
                 if marker_type not in (0x00, 0xFF):
+                    # Skip RST markers in directory to avoid clutter
                     if marker_type >= 0xD0 and marker_type <= 0xD7:
                         i += 2
                         continue
@@ -570,6 +630,7 @@ def scan_jpeg_markers(filepath):
                         'bytes': f"FF {marker_type:02X}"
                     })
                     
+                    # Skip segment length if applicable (markers except SOI, EOI, RST)
                     if marker_type not in (0xD8, 0xD9, 0x01) and not (marker_type >= 0xD0 and marker_type <= 0xD7):
                         if i + 3 < len(data):
                             length = int.from_bytes(data[i+2:i+4], 'big')
@@ -580,13 +641,16 @@ def scan_jpeg_markers(filepath):
         print(f"Error scanning JPEG markers: {e}", file=sys.stderr)
     return markers
 
+
 class HexViewerDialog(QDialog):
     def __init__(self, filepath, parent=None):
         super().__init__(parent)
         self.filepath = filepath
         self.offset = 0
-        self.chunk_size = 2048
+        self.chunk_size = 2048 # 2KB chunk size is extremely fast
         self.total_size = os.path.getsize(filepath) if filepath and os.path.exists(filepath) else 0
+        
+        # Scan markers for structural directory
         self.scanned_markers = scan_jpeg_markers(filepath)
         
         self.init_ui()
@@ -596,27 +660,80 @@ class HexViewerDialog(QDialog):
         self.setWindowTitle(f"Hex Viewer - {os.path.basename(self.filepath)}")
         self.resize(850, 580)
         self.setMinimumSize(800, 450)
+        
+        # Style layout colors matching the core "Deep Tech" system
         self.setStyleSheet("""
-            QDialog { background-color: #0d1117; }
-            QLabel { color: #c9d1d9; font-family: 'Segoe UI'; font-size: 10pt; }
-            QLineEdit { background-color: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 4px; padding: 4px; font-size: 9.5pt; }
-            QLineEdit:focus { border: 1px solid #58a6ff; }
-            QPushButton { background-color: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 4px; padding: 6px 12px; font-weight: bold; font-size: 9.5pt; }
-            QPushButton:hover { background-color: #30363d; }
-            QPushButton:disabled { background-color: #0d1117; color: #8b949e; border-color: #30363d; }
-            QListWidget { background-color: #161b22; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; font-family: 'Segoe UI'; font-size: 9.5pt; padding: 4px; }
-            QListWidget::item { padding: 6px; border-radius: 4px; }
-            QListWidget::item:hover { background-color: #21262d; }
-            QListWidget::item:selected { background-color: #21262d; color: #58a6ff; font-weight: bold; }
+            QDialog {
+                background-color: #0d1117;
+            }
+            QLabel {
+                color: #c9d1d9;
+                font-family: 'Segoe UI';
+                font-size: 10pt;
+            }
+            QLineEdit {
+                background-color: #21262d;
+                color: #c9d1d9;
+                border: 1px solid #30363d;
+                border-radius: 4px;
+                padding: 4px;
+                font-size: 9.5pt;
+            }
+            QLineEdit:focus {
+                border: 1px solid #58a6ff;
+            }
+            QPushButton {
+                background-color: #21262d;
+                color: #c9d1d9;
+                border: 1px solid #30363d;
+                border-radius: 4px;
+                padding: 6px 12px;
+                font-weight: bold;
+                font-size: 9.5pt;
+            }
+            QPushButton:hover {
+                background-color: #30363d;
+            }
+            QPushButton:disabled {
+                background-color: #0d1117;
+                color: #8b949e;
+                border-color: #30363d;
+            }
+            QListWidget {
+                background-color: #161b22;
+                color: #c9d1d9;
+                border: 1px solid #30363d;
+                border-radius: 6px;
+                font-family: 'Segoe UI';
+                font-size: 9.5pt;
+                padding: 4px;
+            }
+            QListWidget::item {
+                padding: 6px;
+                border-radius: 4px;
+            }
+            QListWidget::item:hover {
+                background-color: #21262d;
+            }
+            QListWidget::item:selected {
+                background-color: #21262d;
+                color: #58a6ff;
+                font-weight: bold;
+            }
         """)
         
         layout = QVBoxLayout(self)
         
+        # --- Top Navigation Bar ---
         top_bar = QHBoxLayout()
+        
+        # Offset indicator
         self.info_label = QLabel("Offset: 0x00000000 / 0x00000000 (0.00 MB)")
         top_bar.addWidget(self.info_label)
+        
         top_bar.addStretch(1)
         
+        # Jump to offset input
         top_bar.addWidget(QLabel("Go to Offset:"))
         self.jump_input = QLineEdit()
         self.jump_input.setPlaceholderText("e.g. 0xDA, 256")
@@ -627,13 +744,18 @@ class HexViewerDialog(QDialog):
         self.jump_button = QPushButton("Go")
         self.jump_button.clicked.connect(self.jump_to_offset)
         top_bar.addWidget(self.jump_button)
+        
         layout.addLayout(top_bar)
         
+        # --- Diagnostics Health Checker Header ---
         self.diagnostic_label = QLabel()
         self.run_diagnostics()
         layout.addWidget(self.diagnostic_label)
         
+        # --- Center split horizontal layout ---
         split_layout = QHBoxLayout()
+        
+        # Left directory sidebar
         sidebar_layout = QVBoxLayout()
         sidebar_layout.addWidget(QLabel("<b>JPEG Marker Directory:</b>"))
         
@@ -642,22 +764,31 @@ class HexViewerDialog(QDialog):
         self.populate_marker_directory()
         self.marker_list.itemClicked.connect(self.marker_directory_clicked)
         sidebar_layout.addWidget(self.marker_list)
+        
         split_layout.addLayout(sidebar_layout)
         
+        # Right Text Box
         self.text_box = QTextEdit()
         self.text_box.setReadOnly(True)
         self.text_box.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
         self.text_box.setStyleSheet("""
             QTextEdit {
-                background-color: #0d1117; color: #c9d1d9; border: 1px solid #30363d;
-                border-radius: 6px; font-family: 'Consolas', 'Courier New', monospace;
-                font-size: 10pt; padding: 8px;
+                background-color: #0d1117;
+                color: #c9d1d9;
+                border: 1px solid #30363d;
+                border-radius: 6px;
+                font-family: 'Consolas', 'Courier New', monospace;
+                font-size: 10pt;
+                padding: 8px;
             }
         """)
         split_layout.addWidget(self.text_box, 1)
+        
         layout.addLayout(split_layout)
         
+        # --- Bottom Navigation Bar ---
         bottom_bar = QHBoxLayout()
+        
         self.prev_button = QPushButton("← Prev 2KB")
         self.prev_button.clicked.connect(self.prev_page)
         bottom_bar.addWidget(self.prev_button)
@@ -665,8 +796,10 @@ class HexViewerDialog(QDialog):
         self.next_button = QPushButton("Next 2KB →")
         self.next_button.clicked.connect(self.next_page)
         bottom_bar.addWidget(self.next_button)
+        
         bottom_bar.addStretch(1)
         
+        # Quick legend
         legend = QLabel(
             "Legend: "
             "<span style='color:#58a6ff;'><b>SOI</b></span> | "
@@ -676,11 +809,13 @@ class HexViewerDialog(QDialog):
             "<span style='color:#ffb454;'><b>SOF</b></span>"
         )
         bottom_bar.addWidget(legend)
+        
         bottom_bar.addStretch(1)
         
         close_button = QPushButton("Close")
         close_button.clicked.connect(self.accept)
         bottom_bar.addWidget(close_button)
+        
         layout.addLayout(bottom_bar)
 
     def run_diagnostics(self):
@@ -690,26 +825,32 @@ class HexViewerDialog(QDialog):
         if not self.scanned_markers:
             errors.append("Invalid JPEG: 0 structural markers identified.")
         else:
+            # Check SOI
             if not any(m['bytes'] == "FF D8" for m in self.scanned_markers):
                 errors.append("Missing SOI (Start of Image) marker at start of file.")
             elif self.scanned_markers[0]['bytes'] != "FF D8":
-                warnings.append("SOI is not the very first marker in the file.")
+                warnings.append("SOI is not the very first marker in the file (unusual header).")
                 
+            # Check essential tables
             if not any(m['bytes'] == "FF DB" for m in self.scanned_markers):
                 errors.append("Missing DQT (Quantization Table) structure.")
             if not any(m['bytes'] == "FF C4" for m in self.scanned_markers):
-                warnings.append("Missing DHT (Huffman Table) structure.")
+                warnings.append("Missing DHT (Huffman Table) structure (might be custom DHT/lossless).")
                 
+            # Check SOF
             sof_markers = [m for m in self.scanned_markers if m['bytes'] in ("FF C0", "FF C1", "FF C2", "FF C3")]
             if not sof_markers:
                 errors.append("Missing SOF (Start of Frame) header.")
                 
+            # Check SOS
             if not any(m['bytes'] == "FF DA" for m in self.scanned_markers):
                 errors.append("Missing SOS (Start of Scan) block.")
                 
+            # Check EOI
             if not any(m['bytes'] == "FF D9" for m in self.scanned_markers):
-                errors.append("Missing EOI (End of Image) terminator.")
+                errors.append("Missing EOI (End of Image) terminator. File might be truncated.")
                 
+        # Format HTML status label
         if errors:
             status_text = f"<span style='color:#ff7b72;'><b>✖ Diagnostics:</b> {errors[0]}</span>"
         elif warnings:
@@ -722,13 +863,16 @@ class HexViewerDialog(QDialog):
     def populate_marker_directory(self):
         self.marker_list.clear()
         for marker in self.scanned_markers:
+            # Create list item with marker label and its offset
             item_text = f"{marker['bytes']}  {marker['name']} (0x{marker['offset']:04X})"
             self.marker_list.addItem(item_text)
 
     def marker_directory_clicked(self, item):
+        # Retrieve the selected item index and matching marker offset
         row = self.marker_list.row(item)
         if 0 <= row < len(self.scanned_markers):
             target_offset = self.scanned_markers[row]['offset']
+            # Align offset to 16 bytes, but let the viewer load it directly
             self.offset = target_offset
             self.load_hex_chunk()
 
@@ -737,7 +881,9 @@ class HexViewerDialog(QDialog):
             self.text_box.setHtml("<span style='color:#ff7b72;'>Error: File not found or invalid path.</span>")
             return
             
+        # Ensure offset is bounded
         self.offset = max(0, min(self.offset, self.total_size - 1))
+        # Keep offset aligned to 16-byte boundaries for pristine rendering
         self.offset = (self.offset // 16) * 16
         
         try:
@@ -745,14 +891,17 @@ class HexViewerDialog(QDialog):
                 f.seek(self.offset)
                 data = f.read(self.chunk_size)
                 
+            # Render chunk
             html_dump = self.generate_hex_dump_html(data, self.offset)
             self.text_box.setHtml(html_dump)
             
+            # Update info label
             total_size_mb = self.total_size / (1024 * 1024)
             self.info_label.setText(
                 f"Offset: <b>0x{self.offset:08X}</b> / 0x{self.total_size:08X} ({total_size_mb:.2f} MB)"
             )
             
+            # Enable/disable navigation buttons
             self.prev_button.setEnabled(self.offset > 0)
             self.next_button.setEnabled(self.offset + self.chunk_size < self.total_size)
             
@@ -773,13 +922,14 @@ class HexViewerDialog(QDialog):
             return
             
         try:
+            # Parse hex or dec offset
             if text.lower().startswith("0x"):
                 target = int(text, 16)
             else:
                 try:
-                    target = int(text, 16)
+                    target = int(text, 16) # Auto hex detection
                 except ValueError:
-                    target = int(text, 10)
+                    target = int(text, 10) # Dec
                     
             if 0 <= target < self.total_size:
                 self.offset = target
@@ -806,6 +956,8 @@ class HexViewerDialog(QDialog):
             while j < 16:
                 if j < len(chunk):
                     b = chunk[j]
+                    
+                    # Highlight JPEG Markers (0xFF followed by non-0x00 and non-0xFF)
                     is_marker = False
                     marker_color = None
                     
@@ -813,14 +965,21 @@ class HexViewerDialog(QDialog):
                         next_b = chunk[j+1]
                         if next_b not in (0x00, 0xFF):
                             is_marker = True
-                            if next_b == 0xD8: marker_color = "#58a6ff"
-                            elif next_b == 0xD9: marker_color = "#ff7b72"
-                            elif next_b == 0xDA: marker_color = "#7ee787"
-                            elif next_b in (0xDB, 0xC4): marker_color = "#d2a8ff"
-                            elif next_b in (0xC0, 0xC2): marker_color = "#ffb454"
-                            else: marker_color = "#ffa198"
+                            if next_b == 0xD8:
+                                marker_color = "#58a6ff" # SOI
+                            elif next_b == 0xD9:
+                                marker_color = "#ff7b72" # EOI
+                            elif next_b == 0xDA:
+                                marker_color = "#7ee787" # SOS
+                            elif next_b in (0xDB, 0xC4):
+                                marker_color = "#d2a8ff" # DQT/DHT
+                            elif next_b in (0xC0, 0xC2):
+                                marker_color = "#ffb454" # SOF
+                            else:
+                                marker_color = "#ffa198" # Other markers
                     
                     if is_marker:
+                        # Format as highlighted 2-byte marker
                         b1 = chunk[j]
                         b2 = chunk[j+1]
                         hex_parts.append(f"<span style='color: {marker_color}; font-weight: bold;'>{b1:02X}</span>")
@@ -831,9 +990,11 @@ class HexViewerDialog(QDialog):
                             ascii_parts.append(f"<span style='color: {marker_color}; font-weight: bold;'>{char}</span>")
                         
                         j += 2
-                        if j == 8: hex_parts.append("")
+                        if j == 8:
+                            hex_parts.append("") # spacer
                         continue
                     else:
+                        # Plain byte
                         char = chr(b) if 32 <= b < 127 else "."
                         hex_parts.append(f"{b:02X}")
                         ascii_parts.append(char)
@@ -842,7 +1003,8 @@ class HexViewerDialog(QDialog):
                     ascii_parts.append(" ")
                 
                 j += 1
-                if j == 8: hex_parts.append("")
+                if j == 8:
+                    hex_parts.append("") # spacer
                     
             hex_str1 = " ".join(hex_parts[:8])
             hex_str2 = " ".join(hex_parts[8:])
@@ -864,6 +1026,7 @@ class HexViewerDialog(QDialog):
             
         return "<pre style='margin: 0; font-family: \"Consolas\", \"Courier New\", monospace;'>" + "<br>".join(html_lines) + "</pre>"
 
+
 # ======================================================================
 # --- EXIF Metadata Inspector Components ---
 # ======================================================================
@@ -872,7 +1035,7 @@ class ExifInspectorDialog(QDialog):
     def __init__(self, filepath, parent=None):
         super().__init__(parent)
         self.filepath = filepath
-        self.exif_data = []
+        self.exif_data = [] # List of (Tag Name, Hex ID, Value)
         
         self.init_ui()
         self.load_exif_data()
@@ -881,20 +1044,77 @@ class ExifInspectorDialog(QDialog):
         self.setWindowTitle(f"EXIF Metadata Inspector - {os.path.basename(self.filepath)}")
         self.resize(650, 480)
         self.setMinimumSize(550, 350)
+        
+        # Premium dark-theme matching colors perfectly
         self.setStyleSheet("""
-            QDialog { background-color: #0d1117; }
-            QLabel { color: #c9d1d9; font-family: 'Segoe UI'; font-size: 10pt; }
-            QLineEdit { background-color: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 4px; padding: 6px; font-size: 9.5pt; }
-            QLineEdit:focus { border: 1px solid #58a6ff; }
-            QPushButton { background-color: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 4px; padding: 6px 12px; font-weight: bold; font-size: 9.5pt; }
-            QPushButton:hover { background-color: #30363d; }
-            QTableWidget { background-color: #161b22; color: #c9d1d9; gridline-color: #30363d; border: 1px solid #30363d; border-radius: 6px; font-family: 'Segoe UI'; font-size: 9.5pt; }
-            QTableWidget::item { padding: 6px; }
-            QHeaderView::section { background-color: #21262d; color: #58a6ff; padding: 6px; font-weight: bold; border: 1px solid #30363d; }
+            QDialog {
+                background-color: #0d1117;
+            }
+            QLabel {
+                color: #c9d1d9;
+                font-family: 'Segoe UI';
+                font-size: 10pt;
+            }
+            QLineEdit {
+                background-color: #21262d;
+                color: #c9d1d9;
+                border: 1px solid #30363d;
+                border-radius: 4px;
+                padding: 6px;
+                font-size: 9.5pt;
+            }
+            QLineEdit:focus {
+                border: 1px solid #58a6ff;
+            }
+            QPushButton {
+                background-color: #21262d;
+                color: #c9d1d9;
+                border: 1px solid #30363d;
+                border-radius: 4px;
+                padding: 6px 12px;
+                font-weight: bold;
+                font-size: 9.5pt;
+            }
+            QPushButton:hover {
+                background-color: #30363d;
+            }
+            QTableWidget {
+                background-color: #161b22;
+                color: #c9d1d9;
+                gridline-color: #30363d;
+                border: 1px solid #30363d;
+                border-radius: 6px;
+                font-family: 'Segoe UI';
+                font-size: 9.5pt;
+            }
+            QTableWidget::item {
+                padding: 6px;
+            }
+            QHeaderView::section {
+                background-color: #21262d;
+                color: #58a6ff;
+                padding: 6px;
+                font-weight: bold;
+                border: 1px solid #30363d;
+            }
+            QScrollBar:vertical {
+                border: none;
+                background: #0d1117;
+                width: 8px;
+            }
+            QScrollBar::handle:vertical {
+                background: #30363d;
+                border-radius: 4px;
+                min-height: 20px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: #58a6ff;
+            }
         """)
         
         layout = QVBoxLayout(self)
         
+        # --- Search Bar at the Top ---
         search_layout = QHBoxLayout()
         search_layout.addWidget(QLabel("Search Metadata:"))
         self.search_input = QLineEdit()
@@ -903,6 +1123,7 @@ class ExifInspectorDialog(QDialog):
         search_layout.addWidget(self.search_input)
         layout.addLayout(search_layout)
         
+        # --- Center Table View ---
         self.table = QTableWidget()
         self.table.setColumnCount(3)
         self.table.setHorizontalHeaderLabels(["Tag Name", "Hex ID", "Decoded Value"])
@@ -911,9 +1132,16 @@ class ExifInspectorDialog(QDialog):
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setAlternatingRowColors(True)
-        self.table.setStyleSheet("QTableWidget { alternate-background-color: #0d1117; }")
+        
+        # Apply clean alternating colors in table stylesheet
+        self.table.setStyleSheet("""
+            QTableWidget {
+                alternate-background-color: #0d1117;
+            }
+        """)
         layout.addWidget(self.table)
         
+        # --- Bottom Close Bar ---
         bottom_bar = QHBoxLayout()
         self.status_label = QLabel("Loading metadata...")
         bottom_bar.addWidget(self.status_label)
@@ -943,9 +1171,12 @@ class ExifInspectorDialog(QDialog):
                 tag_name = TAGS.get(tag_id, f"Unknown (Tag {tag_id})")
                 hex_id = f"0x{tag_id:04X}"
                 
+                # Format value cleanly
                 if isinstance(value, bytes):
                     try:
-                        clean_val = value.decode('utf-8', errors='ignore').strip().replace('\x00', '')
+                        clean_val = value.decode('utf-8', errors='ignore').strip()
+                        # Clean binary nulls
+                        clean_val = clean_val.replace('\x00', '')
                     except Exception:
                         clean_val = f"Binary Data ({len(value)} bytes)"
                 else:
@@ -953,9 +1184,13 @@ class ExifInspectorDialog(QDialog):
                     
                 self.exif_data.append((tag_name, hex_id, clean_val))
                 
+            # Sort tags alphabetically by name for pristine organization
             self.exif_data.sort(key=lambda x: x[0])
+            
             self.populate_table(self.exif_data)
             self.status_label.setText(f"Found {len(self.exif_data)} metadata records.")
+            
+            # Auto adjust columns
             self.table.setColumnWidth(0, 180)
             self.table.setColumnWidth(1, 80)
             
@@ -968,6 +1203,8 @@ class ExifInspectorDialog(QDialog):
             item_name = QTableWidgetItem(name)
             item_hex = QTableWidgetItem(hex_id)
             item_val = QTableWidgetItem(value)
+            
+            # Align hex ID to center
             item_hex.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             
             self.table.setItem(row_idx, 0, item_name)
@@ -977,24 +1214,25 @@ class ExifInspectorDialog(QDialog):
     def filter_exif_table(self, query):
         query = query.strip().lower()
         if not query:
+            # Show all
             self.populate_table(self.exif_data)
             self.status_label.setText(f"Found {len(self.exif_data)} metadata records.")
             return
             
-        filtered = [
-            (name, hex_id, value) for name, hex_id, value in self.exif_data
-            if query in name.lower() or query in value.lower() or query in hex_id.lower()
-        ]
+        filtered = []
+        for name, hex_id, value in self.exif_data:
+            if query in name.lower() or query in value.lower() or query in hex_id.lower():
+                filtered.append((name, hex_id, value))
+                
         self.populate_table(filtered)
         self.status_label.setText(f"Matches: {len(filtered)} of {len(self.exif_data)}")
 
-# ======================================================================
-# --- Main Window ---
-# ======================================================================
 
+# --- Main Window ---
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        # Calculate DPI scale factor for High-DPI screen adjustments
         logical_dpi = QApplication.primaryScreen().logicalDotsPerInch()
         self.dpi_scale = logical_dpi / 96.0
         
@@ -1010,11 +1248,14 @@ class MainWindow(QMainWindow):
         self.view = McuGraphicsView(self.scene)
         self.grid_item = None
         
-        self.view_mode = "YCbCr"
+        # --- Channel View Options (YCbCr, Y, Cb, Cr) ---
+        self.view_mode = "YCbCr" # Default viewing mode
         
+        # Setup context menu policy on the view
         self.view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.view.customContextMenuRequested.connect(self.show_view_context_menu)
         
+        # Define actions for view modes with shortcuts
         self.action_ycbcr = QAction("YCbCr", self)
         self.action_ycbcr.setShortcut("Ctrl+0")
         self.action_ycbcr.setCheckable(True)
@@ -1040,11 +1281,13 @@ class MainWindow(QMainWindow):
         self.action_cr.triggered.connect(lambda: self.set_view_mode("Cr"))
         self.addAction(self.action_cr)
         
+        # Define Hex Viewer Action
         self.action_view_hex = QAction("View Hex", self)
         self.action_view_hex.setShortcut("Ctrl+H")
         self.action_view_hex.triggered.connect(self.show_hex_viewer)
         self.addAction(self.action_view_hex)
         
+        # Define EXIF Inspector Action
         self.action_view_exif = QAction("View EXIF Info", self)
         self.action_view_exif.setShortcut("Ctrl+E")
         self.action_view_exif.triggered.connect(self.show_exif_inspector)
@@ -1053,10 +1296,12 @@ class MainWindow(QMainWindow):
         central_widget = QWidget()
         outer_layout = QHBoxLayout(central_widget)
 
+        # --- Left/Main Content Area ---
         left_content_layout = QVBoxLayout()
         left_content_layout.addWidget(self.view)
         outer_layout.addLayout(left_content_layout, 1) 
 
+        # --- Right Panel (Scroll Area Container) ---
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -1131,11 +1376,14 @@ class MainWindow(QMainWindow):
         mcu_previews_group.setLayout(previews_layout)
         right_panel_layout.addWidget(mcu_previews_group)
         
-        # 3. Tab Widget
+        # 3. Tab Widget for Repair/Color Correction
+        
+        # --- Repair Tab ---
         repair_tab = QWidget()
         repair_layout = QVBoxLayout(repair_tab)
         repair_layout.setContentsMargins(0, 0, 0, 0) 
         
+        # MCU Repair
         mcu_repair_group = QGroupBox("MCU Edit")
         mcu_repair_layout = QGridLayout()
         mcu_repair_layout.setContentsMargins(10, 20, 10, 10)
@@ -1157,6 +1405,7 @@ class MainWindow(QMainWindow):
         self.delete_button.setEnabled(False)
         mcu_repair_layout.addWidget(self.delete_button, 0, 3)
 
+        # Header Crop Analysis 
         mcu_repair_layout.addWidget(QLabel("Gray Scanlines Found:"), 1, 0)
         self.gray_scanline_count_label_mini = QLabel("--- / --- (0%)")
         mcu_repair_layout.addWidget(self.gray_scanline_count_label_mini, 1, 1, 1, 3)
@@ -1175,10 +1424,13 @@ class MainWindow(QMainWindow):
         repair_layout.addWidget(mcu_repair_group)
         repair_layout.addStretch(1)
 
+
+        # --- Color Correction Tab ---
         color_tab = QWidget()
         color_layout = QVBoxLayout(color_tab)
         color_layout.setContentsMargins(0, 0, 0, 0) 
         
+        # Manual Color Adjustment
         manual_color_group = QGroupBox("Manual Color")
         manual_color_layout = QVBoxLayout()
         manual_color_layout.setContentsMargins(10, 20, 10, 10)
@@ -1209,6 +1461,7 @@ class MainWindow(QMainWindow):
         self.cr_slider, cr_layout = create_slider("Cr")
         manual_color_layout.addLayout(cr_layout)
         
+        
         self.cdelta_button = QPushButton("Apply")
         self.cdelta_button.setObjectName("SecondaryButton")
         self.cdelta_button.clicked.connect(self.run_cdelta_repair)
@@ -1218,6 +1471,7 @@ class MainWindow(QMainWindow):
         manual_color_group.setLayout(manual_color_layout)
         color_layout.addWidget(manual_color_group)
 
+        # Automatic Color Correction
         auto_color_group = QGroupBox("Auto color")
         auto_color_layout = QVBoxLayout()
         auto_color_layout.setContentsMargins(10, 20, 10, 10)
@@ -1232,6 +1486,7 @@ class MainWindow(QMainWindow):
         color_layout.addWidget(auto_color_group)
         color_layout.addStretch(1) 
         
+        # --- NEW: Batch Processing Tab ---
         batch_tab = QWidget()
         batch_layout = QVBoxLayout(batch_tab)
         batch_layout.setContentsMargins(10, 10, 10, 10)
@@ -1242,6 +1497,7 @@ class MainWindow(QMainWindow):
         batch_grid.setColumnStretch(1, 1)
         batch_grid.setColumnStretch(2, 0)
         
+        # 1. Reference JPEG Path
         batch_grid.addWidget(QLabel("Reference JPEG:"), 0, 0)
         self.reference_jpeg_input = QLineEdit()
         self.reference_jpeg_input.setPlaceholderText("Select a known good JPEG file...")
@@ -1250,6 +1506,7 @@ class MainWindow(QMainWindow):
         self.select_ref_button.clicked.connect(self.selectReferenceJPEG)
         batch_grid.addWidget(self.select_ref_button, 0, 2)
         
+        # 2. Encrypted Folder Path
         batch_grid.addWidget(QLabel("Encrypted Folder:"), 1, 0)
         self.encrypted_folder_input = QLineEdit()
         self.encrypted_folder_input.setPlaceholderText("Select folder containing encrypted files...")
@@ -1258,6 +1515,7 @@ class MainWindow(QMainWindow):
         self.select_folder_button.clicked.connect(self.selectEncryptedFolder)
         batch_grid.addWidget(self.select_folder_button, 1, 2)
         
+        # 3. Process Button
         self.auto_batch_process_button = QPushButton("Start")
         self.auto_batch_process_button.setObjectName("PrimaryButton")
         self.auto_batch_process_button.clicked.connect(self.repairJPEGs)
@@ -1266,24 +1524,27 @@ class MainWindow(QMainWindow):
         batch_group.setLayout(batch_grid)
         batch_layout.addWidget(batch_group)
         
+        # 4. Progress and Output
         self.progress_bar = QProgressBar(self)
         batch_layout.addWidget(self.progress_bar)
         
         self.output_text = QTextEdit()
         self.output_text.setReadOnly(True)
         self.output_text.setObjectName("OutputText")
+        # Set monospace terminal font programmatically to protect High-DPI scaling
         self.output_text.setFont(QFont("Consolas", 10))
         batch_layout.addWidget(QLabel("Log:"))
         batch_layout.addWidget(self.output_text, 1)
         
+        # Tab Widget container
         self.tab_widget = QTabWidget()
         self.tab_widget.addTab(repair_tab, "Repair")
         self.tab_widget.addTab(color_tab, "Color")
-        self.tab_widget.addTab(batch_tab, "Batch")
+        self.tab_widget.addTab(batch_tab, "Batch") # ADDED BATCH TAB
         
         right_panel_layout.addWidget(self.tab_widget)
         
-        # 4. MCU Info
+        # 4. Selected MCU Information
         selection_info_group = QGroupBox("MCU Info")
         selection_layout = QGridLayout()
         selection_layout.setContentsMargins(10, 20, 10, 10)
@@ -1312,21 +1573,24 @@ class MainWindow(QMainWindow):
         outer_layout.addWidget(self.scroll_area)
         
         self.setCentralWidget(central_widget)
+        
+        # Apply the dark theme
         self.apply_dark_theme()
-
+        
+    # --- Dark Theme Implementation (Unchanged) ---
     def apply_dark_theme(self):
-        BG_DARK = "#0d1117"
-        BG_MID = "#161b22"
-        BG_LIGHT = "#21262d"
-        TEXT_COLOR = "#c9d1d9"
-        TEXT_MUTED = "#8b949e"
-        ACCENT_BLUE = "#58a6ff"
+        BG_DARK = "#0d1117"     # Deep space base
+        BG_MID = "#161b22"      # Clean dashboard cards
+        BG_LIGHT = "#21262d"    # Buttons & Inputs base
+        TEXT_COLOR = "#c9d1d9"  # Primary off-white text
+        TEXT_MUTED = "#8b949e"  # Subtle gray text
+        ACCENT_BLUE = "#58a6ff" # Cyber blue
         ACCENT_BLUE_GLOW = "#79c0ff"
-        ACCENT_RED = "#ff7b72"
+        ACCENT_RED = "#ff7b72"  # Coral red
         ACCENT_RED_GLOW = "#ffa198"
-        ACCENT_GREEN = "#3fb950"
+        ACCENT_GREEN = "#3fb950"# Emerald green
         ACCENT_GREEN_GLOW = "#56d364"
-        BORDER_GRAY = "#30363d"
+        BORDER_GRAY = "#30363d" # Clean boundary outlines
         BORDER_LIGHT = "#484f58"
 
         palette = QPalette()
@@ -1341,83 +1605,364 @@ class MainWindow(QMainWindow):
         QApplication.setPalette(palette)
 
         style_sheet = f"""
-        * {{ font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, Helvetica, Arial, sans-serif; font-size: 10pt; }}
-        QMainWindow {{ background-color: {BG_DARK}; }}
-        QWidget#RightPanel {{ background-color: {BG_DARK}; border-left: 1px solid {BORDER_GRAY}; }}
-        QGroupBox {{ font-weight: bold; font-size: 10pt; color: {TEXT_COLOR}; background-color: {BG_MID}; border: 1px solid {BORDER_GRAY}; border-radius: 8px; margin-top: 18px; padding: 10px; }}
-        QGroupBox::title {{ subcontrol-origin: margin; subcontrol-position: top left; padding: 2px 10px; left: 10px; font-size: 9pt; text-transform: uppercase; letter-spacing: 1px; color: {ACCENT_BLUE}; background-color: {BG_DARK}; border: 1px solid {BORDER_GRAY}; border-radius: 4px; }}
-        QLabel {{ color: {TEXT_COLOR}; font-size: 10pt; padding: 2px 0; }}
-        QTextEdit#OutputText {{ background-color: {BG_DARK}; color: #7ee787; border: 1px solid {BORDER_GRAY}; border-radius: 6px; padding: 8px; font-size: 10pt; }}
-        QLineEdit, QSpinBox {{ background-color: {BG_LIGHT}; color: {TEXT_COLOR}; border: 1px solid {BORDER_GRAY}; border-radius: 6px; padding: 6px; font-size: 10pt; selection-background-color: {ACCENT_BLUE}; }}
-        QLineEdit:focus, QSpinBox:focus {{ border: 1px solid {ACCENT_BLUE}; }}
-        QSpinBox::up-button, QSpinBox::down-button {{ width: 20px; border: none; background-color: {BG_LIGHT}; }}
-        QSpinBox::up-button:hover, QSpinBox::down-button:hover {{ background-color: {BORDER_GRAY}; }}
-        QPushButton {{ background-color: {BG_LIGHT}; color: {TEXT_COLOR}; border: 1px solid {BORDER_GRAY}; border-radius: 6px; padding: 8px 12px; font-weight: bold; font-size: 10pt; }}
-        QPushButton:hover {{ background-color: {BORDER_GRAY}; border-color: {BORDER_LIGHT}; }}
-        QPushButton:pressed {{ background-color: {BORDER_LIGHT}; }}
-        QPushButton:disabled {{ background-color: {BG_DARK}; border-color: {BORDER_GRAY}; color: {TEXT_MUTED}; }}
-        QPushButton#PrimaryButton {{ background-color: {ACCENT_BLUE}; color: {BG_DARK}; border: none; font-weight: bold; font-size: 10pt; padding: 10px; }}
-        QPushButton#PrimaryButton:hover {{ background-color: {ACCENT_BLUE_GLOW}; }}
-        QPushButton#PrimaryButton:disabled {{ background-color: {BG_LIGHT}; color: {TEXT_MUTED}; }}
-        QPushButton#SecondaryButton {{ background-color: {ACCENT_RED}; color: {BG_DARK}; border: none; font-weight: bold; font-size: 10pt; }}
-        QPushButton#SecondaryButton:hover {{ background-color: {ACCENT_RED_GLOW}; }}
-        QPushButton#SecondaryButton:disabled {{ background-color: {BG_LIGHT}; color: {TEXT_MUTED}; }}
-        QPushButton#AccentButton {{ background-color: {ACCENT_GREEN}; color: {BG_DARK}; border: none; font-weight: bold; font-size: 10pt; }}
-        QPushButton#AccentButton:hover {{ background-color: {ACCENT_GREEN_GLOW}; }}
-        QPushButton#AccentButton:disabled {{ background-color: {BG_LIGHT}; color: {TEXT_MUTED}; }}
-        QSlider::groove:horizontal {{ border: 1px solid {BORDER_GRAY}; height: 6px; background: {BG_DARK}; border-radius: 3px; }}
-        QSlider::handle:horizontal {{ background: {ACCENT_BLUE}; border: 1px solid {BORDER_GRAY}; width: 14px; height: 14px; margin: -4px 0; border-radius: 7px; }}
-        QSlider::handle:horizontal:hover {{ background: {ACCENT_BLUE_GLOW}; }}
-        QTabWidget::pane {{ border: 1px solid {BORDER_GRAY}; background-color: {BG_MID}; border-radius: 8px; top: -1px; }}
-        QTabBar::tab {{ background: {BG_DARK}; color: {TEXT_MUTED}; padding: 8px 16px; border: 1px solid {BORDER_GRAY}; border-bottom: none; border-top-left-radius: 6px; border-top-right-radius: 6px; margin-right: 2px; text-transform: uppercase; font-weight: bold; font-size: 9pt; letter-spacing: 0.5px; }}
-        QTabBar::tab:selected {{ background: {BG_MID}; color: {ACCENT_BLUE}; border-bottom: 2px solid {ACCENT_BLUE}; }}
-        QTabBar::tab:hover {{ background: {BG_LIGHT}; color: {TEXT_COLOR}; }}
-        QProgressBar {{ border: 1px solid {BORDER_GRAY}; border-radius: 6px; text-align: center; color: {TEXT_COLOR}; background-color: {BG_DARK}; font-weight: bold; font-size: 9pt; height: 18px; }}
-        QProgressBar::chunk {{ background-color: {ACCENT_BLUE}; border-radius: 5px; }}
-        QGraphicsView {{ border: 1px solid {BORDER_GRAY}; background-color: {BG_DARK}; border-radius: 8px; }}
-        QScrollArea#RightPanelScroll {{ border: none; background-color: {BG_DARK}; }}
-        QScrollBar:vertical {{ border: none; background: {BG_DARK}; width: 8px; margin: 0px; }}
-        QScrollBar::handle:vertical {{ background: {BORDER_GRAY}; min-height: 20px; border-radius: 4px; }}
-        QScrollBar::handle:vertical:hover {{ background: {ACCENT_BLUE}; }}
-        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ border: none; background: none; height: 0px; }}
-        QMessageBox {{ background-color: {BG_DARK}; border: 1px solid {BORDER_GRAY}; }}
-        QMessageBox QLabel {{ color: {TEXT_COLOR}; font-size: 10pt; }}
-        QMessageBox QPushButton {{ background-color: {BG_LIGHT}; color: {TEXT_COLOR}; border: 1px solid {BORDER_GRAY}; border-radius: 6px; padding: 6px 16px; font-weight: bold; font-size: 9.5pt; min-width: 75px; }}
-        QMessageBox QPushButton:hover {{ background-color: {BORDER_GRAY}; border-color: {BORDER_LIGHT}; }}
-        QMessageBox QPushButton:pressed {{ background-color: {BORDER_LIGHT}; }}
-        QMenu {{ background-color: {BG_MID}; color: {TEXT_COLOR}; border: 1px solid {BORDER_GRAY}; border-radius: 6px; padding: 4px 0px; }}
-        QMenu::item {{ padding: 6px 24px 6px 20px; background-color: transparent; }}
-        QMenu::item:selected {{ background-color: {BG_LIGHT}; color: {ACCENT_BLUE}; }}
-        QMenu::separator {{ height: 1px; background-color: {BORDER_GRAY}; margin: 4px 0px; }}
+        * {{
+            font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, Helvetica, Arial, sans-serif;
+            font-size: 10pt;
+        }}
+
+        QMainWindow {{
+            background-color: {BG_DARK};
+        }}
+
+        QWidget#RightPanel {{
+            background-color: {BG_DARK};
+            border-left: 1px solid {BORDER_GRAY};
+        }}
+        
+        QGroupBox {{
+            font-weight: bold;
+            font-size: 10pt;
+            color: {TEXT_COLOR};
+            background-color: {BG_MID};
+            border: 1px solid {BORDER_GRAY};
+            border-radius: 8px;
+            margin-top: 18px;
+            padding: 10px;
+        }}
+        
+        QGroupBox::title {{
+            subcontrol-origin: margin;
+            subcontrol-position: top left;
+            padding: 2px 10px;
+            left: 10px;
+            font-size: 9pt;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: {ACCENT_BLUE};
+            background-color: {BG_DARK};
+            border: 1px solid {BORDER_GRAY};
+            border-radius: 4px;
+        }}
+
+        QLabel {{
+            color: {TEXT_COLOR};
+            font-size: 10pt;
+            padding: 2px 0;
+        }}
+        
+        QTextEdit#OutputText {{
+            background-color: {BG_DARK};
+            color: #7ee787; /* Neon green terminal output */
+            border: 1px solid {BORDER_GRAY};
+            border-radius: 6px;
+            padding: 8px;
+            font-size: 10pt;
+        }}
+
+        QLineEdit, QSpinBox {{
+            background-color: {BG_LIGHT};
+            color: {TEXT_COLOR};
+            border: 1px solid {BORDER_GRAY};
+            border-radius: 6px;
+            padding: 6px;
+            font-size: 10pt;
+            selection-background-color: {ACCENT_BLUE};
+        }}
+        
+        QLineEdit:focus, QSpinBox:focus {{
+            border: 1px solid {ACCENT_BLUE};
+        }}
+
+        /* --- SpinBox Specific Styles --- */
+        QSpinBox::up-button, QSpinBox::down-button {{
+            width: 20px; 
+            border: none;
+            background-color: {BG_LIGHT};
+        }}
+        QSpinBox::up-button:hover, QSpinBox::down-button:hover {{
+            background-color: {BORDER_GRAY};
+        }}
+        QSpinBox::up-arrow {{
+            image: url(data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMjQiIGhlaWdodD0iMjQiIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTEyIDhMMTYgMTJIOEwxMiA4WiIgZmlsbD0iI2M5ZDFkOSIvPgo8L3N2Zz4=);
+        }}
+        QSpinBox::down-arrow {{
+            image: url(data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMjQiIGhlaWdodD0iMjQiIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTEyIDE2TDE2IDEySDhMMTIgMTZaIiBmaWxsPSIjYzlkMWQ5Ii8+Cjwvc3ZnPg==);
+        }}
+
+        /* --- Buttons --- */
+        QPushButton {{
+            background-color: {BG_LIGHT};
+            color: {TEXT_COLOR};
+            border: 1px solid {BORDER_GRAY};
+            border-radius: 6px;
+            padding: 8px 12px;
+            font-weight: bold;
+            font-size: 10pt;
+        }}
+
+        QPushButton:hover {{
+            background-color: {BORDER_GRAY};
+            border-color: {BORDER_LIGHT};
+        }}
+
+        QPushButton:pressed {{
+            background-color: {BORDER_LIGHT};
+        }}
+        
+        QPushButton:disabled {{
+            background-color: {BG_DARK};
+            border-color: {BORDER_GRAY};
+            color: {TEXT_MUTED};
+        }}
+
+        /* Primary Button (Open/Submit - Accent Blue) */
+        QPushButton#PrimaryButton {{
+            background-color: {ACCENT_BLUE};
+            color: {BG_DARK};
+            border: none;
+            font-weight: bold;
+            font-size: 10pt;
+            padding: 10px;
+        }}
+        QPushButton#PrimaryButton:hover {{
+            background-color: {ACCENT_BLUE_GLOW};
+        }}
+        QPushButton#PrimaryButton:disabled {{
+            background-color: {BG_LIGHT};
+            color: {TEXT_MUTED};
+        }}
+        
+        /* Secondary Button (Apply CDelta - Accent Red) */
+        QPushButton#SecondaryButton {{
+            background-color: {ACCENT_RED};
+            color: {BG_DARK};
+            border: none;
+            font-weight: bold;
+            font-size: 10pt;
+        }}
+        QPushButton#SecondaryButton:hover {{
+            background-color: {ACCENT_RED_GLOW};
+        }}
+        QPushButton#SecondaryButton:disabled {{
+            background-color: {BG_LIGHT};
+            color: {TEXT_MUTED};
+        }}
+
+        /* Accent Button (Auto Color - Soft Green/Yellow) */
+        QPushButton#AccentButton {{
+            background-color: {ACCENT_GREEN}; 
+            color: {BG_DARK};
+            border: none;
+            font-weight: bold;
+            font-size: 10pt;
+        }}
+        QPushButton#AccentButton:hover {{
+            background-color: {ACCENT_GREEN_GLOW};
+        }}
+        QPushButton#AccentButton:disabled {{
+            background-color: {BG_LIGHT};
+            color: {TEXT_MUTED};
+        }}
+        
+        /* --- Sliders --- */
+        QSlider::groove:horizontal {{
+            border: 1px solid {BORDER_GRAY};
+            height: 6px;
+            background: {BG_DARK};
+            border-radius: 3px;
+        }}
+        
+        QSlider::handle:horizontal {{
+            background: {ACCENT_BLUE};
+            border: 1px solid {BORDER_GRAY};
+            width: 14px;
+            height: 14px;
+            margin: -4px 0;
+            border-radius: 7px;
+        }}
+        
+        QSlider::handle:horizontal:hover {{
+            background: {ACCENT_BLUE_GLOW};
+        }}
+        
+        /* --- Tab Widget --- */
+        QTabWidget::pane {{ 
+            border: 1px solid {BORDER_GRAY};
+            background-color: {BG_MID};
+            border-radius: 8px;
+            top: -1px;
+        }}
+        
+        QTabBar::tab {{
+            background: {BG_DARK};
+            color: {TEXT_MUTED};
+            padding: 8px 16px;
+            border: 1px solid {BORDER_GRAY};
+            border-bottom: none; 
+            border-top-left-radius: 6px;
+            border-top-right-radius: 6px;
+            margin-right: 2px;
+            text-transform: uppercase;
+            font-weight: bold;
+            font-size: 9pt;
+            letter-spacing: 0.5px;
+        }}
+        
+        QTabBar::tab:selected {{
+            background: {BG_MID}; 
+            color: {ACCENT_BLUE};
+            border-bottom: 2px solid {ACCENT_BLUE}; 
+        }}
+        
+        QTabBar::tab:hover {{
+            background: {BG_LIGHT};
+            color: {TEXT_COLOR};
+        }}
+        
+        /* --- Progress Bar --- */
+        QProgressBar {{
+            border: 1px solid {BORDER_GRAY};
+            border-radius: 6px;
+            text-align: center;
+            color: {TEXT_COLOR};
+            background-color: {BG_DARK};
+            font-weight: bold;
+            font-size: 9pt;
+            height: 18px;
+        }}
+        QProgressBar::chunk {{
+            background-color: {ACCENT_BLUE};
+            border-radius: 5px;
+        }}
+
+        /* --- Graphics View (Main Image Area) --- */
+        QGraphicsView {{
+            border: 1px solid {BORDER_GRAY};
+            background-color: {BG_DARK};
+            border-radius: 8px;
+        }}
+
+        /* --- Custom ScrollBar Styles --- */
+        QScrollArea#RightPanelScroll {{
+            border: none;
+            background-color: {BG_DARK};
+        }}
+
+        QScrollBar:vertical {{
+            border: none;
+            background: {BG_DARK};
+            width: 8px;
+            margin: 0px 0px 0px 0px;
+        }}
+
+        QScrollBar::handle:vertical {{
+            background: {BORDER_GRAY};
+            min-height: 20px;
+            border-radius: 4px;
+        }}
+
+        QScrollBar::handle:vertical:hover {{
+            background: {ACCENT_BLUE};
+        }}
+
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+            border: none;
+            background: none;
+            height: 0px;
+        }}
+
+        /* --- QMessageBox Styles --- */
+        QMessageBox {{
+            background-color: {BG_DARK};
+            border: 1px solid {BORDER_GRAY};
+        }}
+        QMessageBox QLabel {{
+            color: {TEXT_COLOR};
+            font-size: 10pt;
+        }}
+        QMessageBox QPushButton {{
+            background-color: {BG_LIGHT};
+            color: {TEXT_COLOR};
+            border: 1px solid {BORDER_GRAY};
+            border-radius: 6px;
+            padding: 6px 16px;
+            font-weight: bold;
+            font-size: 9.5pt;
+            min-width: 75px;
+        }}
+        QMessageBox QPushButton:hover {{
+            background-color: {BORDER_GRAY};
+            border-color: {BORDER_LIGHT};
+        }}
+        QMessageBox QPushButton:pressed {{
+            background-color: {BORDER_LIGHT};
+        }}
+
+        /* --- QMenu (Right-Click Context Menu) --- */
+        QMenu {{
+            background-color: {BG_MID};
+            color: {TEXT_COLOR};
+            border: 1px solid {BORDER_GRAY};
+            border-radius: 6px;
+            padding: 4px 0px;
+        }}
+        QMenu::item {{
+            padding: 6px 24px 6px 20px;
+            background-color: transparent;
+        }}
+        QMenu::item:selected {{
+            background-color: {BG_LIGHT};
+            color: {ACCENT_BLUE};
+        }}
+        QMenu::separator {{
+            height: 1px;
+            background-color: {BORDER_GRAY};
+            margin: 4px 0px;
+        }}
+        QMenu::indicator {{
+            width: 14px;
+            height: 14px;
+            left: 4px;
+        }}
         """
         self.setStyleSheet(style_sheet)
-
+        
+    
+    # --- MCU Pixel Extraction with Pillow (Unchanged) ---
     def get_mcu_block_pixmap(self, r, c):
         if not self.current_filepath or not self.current_mcu_data: return QPixmap()
 
         data = self.current_mcu_data
         x_start = c * data['mcu_x']
         y_start = r * data['mcu_y']
+        
+        # Calculate crop box (x_min, y_min, x_max, y_max)
         crop_box = (x_start, y_start, x_start + data['mcu_x'], y_start + data['mcu_y'])
         
         try:
             img = Image.open(self.current_filepath)
             mcu_img = img.crop(crop_box)
             
+            # Apply channel extraction to the cropped block if not YCbCr!
             if self.view_mode != "YCbCr":
                 ycbcr = mcu_img.convert('YCbCr')
                 channels = ycbcr.split()
+                
                 target_channel = None
                 mode = self.view_mode
-                if mode == "Y": target_channel = channels[0]
-                elif mode == "Cb": target_channel = channels[1]
-                elif mode == "Cr": target_channel = channels[2]
+                if mode == "Y":
+                    target_channel = channels[0]
+                elif mode == "Cb":
+                    target_channel = channels[1]
+                elif mode == "Cr":
+                    target_channel = channels[2]
                         
                 if target_channel:
                     mcu_img = target_channel
             
             buffer = QBuffer()
             buffer.open(QIODevice.OpenModeFlag.ReadWrite)
+            # Save as PNG to QBuffer to get a Pixmap for display
             mcu_img.save(buffer, "PNG") 
             pixmap = QPixmap()
             pixmap.loadFromData(buffer.data())
@@ -1429,6 +1974,8 @@ class MainWindow(QMainWindow):
             pass
         return QPixmap()
 
+
+    # --- Display/Feedback Methods (Unchanged) ---
     def display_hover_info(self, r, c):
         mcu_pixmap = self.get_mcu_block_pixmap(r, c)
         self.pixel_block_preview.update_pixmap(mcu_pixmap)
@@ -1446,10 +1993,12 @@ class MainWindow(QMainWindow):
         self.selected_block_preview.update_pixmap(mcu_pixmap)
         
         n_mcu_x = self.grid_item.n_mcu_x
+
         mcu_index = r * n_mcu_x + c + 1
         
         x_start = c * data['mcu_x']
         y_start = r * data['mcu_y']
+        
         x_end = min((c + 1) * data['mcu_x'] - 1, data['width'] - 1)
         y_end = min((r + 1) * data['mcu_y'] - 1, data['height'] - 1)
         
@@ -1461,9 +2010,11 @@ class MainWindow(QMainWindow):
         self.pixel_range_label.setText(f"X: {x_start}-{x_end}, Y: {y_start}-{y_end}")
         
         avg_ycbr = get_mcu_avg_ycbr_values(self.current_filepath, data, r, c)
+        
         if avg_ycbr:
             y, cb, cr = avg_ycbr
-            self.avg_ycbr_label.setText(f"Y: {y:.2f}, Cb: {cb:.2f}, Cr: {cr:.2f}")
+            ycbr_text = f"Y: {y:.2f}, Cb: {cb:.2f}, Cr: {cr:.2f}"
+            self.avg_ycbr_label.setText(ycbr_text)
         else:
             self.avg_ycbr_label.setText("Y: ---, Cb: ---, Cr: --- (Error)")
 
@@ -1480,14 +2031,19 @@ class MainWindow(QMainWindow):
         self.selected_block_preview.set_active_state(False)
         self.clear_hover_info()
 
+
+    # --- Image Loading Logic (Unchanged) ---
     def load_and_display_image(self, filepath):
+        
         image_pixmap = QPixmap(filepath)
         if image_pixmap.isNull():
+            # Only reset GUI if original load fails
             if filepath == self.original_filepath:
                 QMessageBox.critical(self, "Error", "Failed to load image file. Check file path/permissions.")
                 self.reset_gui()
+            # If a repair file fails to load, keep the original loaded state
             else:
-                QMessageBox.critical(self, "Error", f"Failed to load repaired image: {os.path.basename(filepath)}. Keeping current view.")
+                 QMessageBox.critical(self, "Error", f"Failed to load repaired image: {os.path.basename(filepath)}. Keeping current view.")
             return
 
         mcu_data = get_jpeg_mcu_data(filepath)
@@ -1496,19 +2052,26 @@ class MainWindow(QMainWindow):
             mcu_data['width'] = image_pixmap.width()
             mcu_data['height'] = image_pixmap.height()
             self.current_mcu_data = mcu_data
-            self.current_filepath = filepath
+            self.current_filepath = filepath # Update current path if successful
             
-            self.dim_label_mini.setText(f"{mcu_data['width']} x {mcu_data['height']}")
-            self.mcu_label_mini.setText(f"{mcu_data['mcu_x']} x {mcu_data['mcu_y']}")
-            self.current_file_label_mini.setText(os.path.basename(filepath))
+            dim_text = f"{mcu_data['width']} x {mcu_data['height']}"
+            mcu_text = f"{mcu_data['mcu_x']} x {mcu_data['mcu_y']}"
+            file_name = os.path.basename(filepath)
             
+            self.dim_label_mini.setText(dim_text)
+            self.mcu_label_mini.setText(mcu_text)
+            self.current_file_label_mini.setText(file_name)
+            
+            # 1. Vertical Gray Scanline Detection (for Header Crop)
             try:
                 vertical_gray_count, total_scanlines, _ = count_gray_mcu_scanlines(filepath, mcu_data)
+                
                 self.vertical_gray_scanlines_to_remove = vertical_gray_count
                 
                 if total_scanlines > 0:
                     percentage = (vertical_gray_count / total_scanlines) * 100
-                    self.gray_scanline_count_label_mini.setText(f"{vertical_gray_count} / {total_scanlines} ({percentage:.1f}%)")
+                    scanline_text = f"{vertical_gray_count} / {total_scanlines} ({percentage:.1f}%)"
+                    self.gray_scanline_count_label_mini.setText(scanline_text)
                     self.execute_header_crop_button.setEnabled(vertical_gray_count > 0)
                 else:
                     self.gray_scanline_count_label_mini.setText("0 / 0 (0%)")
@@ -1518,24 +2081,33 @@ class MainWindow(QMainWindow):
                 self.execute_header_crop_button.setEnabled(False)
                 print(f"Error during gray scanline analysis: {e}", file=sys.stderr)
             
+            # 2. Horizontal MCU Analysis (for Auto Alignment)
             try:
                 horizontal_gray_mcu_count = analyze_last_scanline_mcus(filepath, mcu_data)
                 self.post_crop_gray_mcu_count = horizontal_gray_mcu_count
                 
+                # Auto alignment is enabled only if blocks need to be inserted 
+                # AND it's a file that has been processed (i.e., not the initial load)
                 is_initial_file = (self.original_filepath == filepath)
+                
                 if not is_initial_file and horizontal_gray_mcu_count > 0:
                     self.auto_align_button.setEnabled(True)
+                    # Inserted blocks = gray count remaining + 1 (the original block that was short)
                     insert_blocks = horizontal_gray_mcu_count + 1 
                     self.auto_align_button.setText(f"Auto Alignment (Insert {insert_blocks} Blocks at Header)")
                 else:
                     self.auto_align_button.setEnabled(False)
                     self.auto_align_button.setText("Auto Alignment")
+
+
             except Exception as e:
                 self.post_crop_gray_mcu_count = 0
                 self.auto_align_button.setEnabled(False)
                 self.auto_align_button.setText("Auto Alignment")
                 print(f"Error during auto alignment analysis: {e}", file=sys.stderr)
 
+
+            # Get styled pixmap based on the current view mode
             display_pixmap = self.get_channel_pixmap(filepath, self.view_mode)
 
             self.scene.clear()
@@ -1546,6 +2118,7 @@ class MainWindow(QMainWindow):
             self.view.fitInView(self.grid_item, Qt.AspectRatioMode.KeepAspectRatio)
             self.grid_item.setFocus(Qt.FocusReason.NoFocusReason)
             
+            # Enable all main controls
             self.insert_button.setEnabled(True)
             self.delete_button.setEnabled(True)
             self.reset_button.setEnabled(True) 
@@ -1554,34 +2127,49 @@ class MainWindow(QMainWindow):
             self.view_exif_button.setEnabled(True)
             self.cdelta_button.setEnabled(True) 
             self.auto_color_button.setEnabled(True) 
+            
             self.toggle_grid_button.setText("Show MCU Grid")
             
             self.clear_mcu_info() 
+            # Simulate click on (0, 0) to initialize selection
             self.grid_item.mousePressEvent(self._create_fake_event()) 
         else:
             self.reset_gui()
-
+            
+    # --- Channel View Methods (YCbCr, Y, Cb, Cr) ---
     def set_view_mode(self, mode):
         self.view_mode = mode
+        
+        # Sync checkmarks in context menu actions
         self.action_ycbcr.setChecked(mode == "YCbCr")
         self.action_y.setChecked(mode == "Y")
         self.action_cb.setChecked(mode == "Cb")
         self.action_cr.setChecked(mode == "Cr")
+        
+        # Update the image canvas
         self.update_image_view_mode()
         
+        # Update current selected block and hover preview instantly
         c = getattr(self, 'selected_mcu_c', 0)
         r = getattr(self, 'selected_mcu_r', 0)
         self.display_mcu_info(r, c)
 
     def update_image_view_mode(self):
-        if not self.current_filepath or not self.grid_item: return
+        if not self.current_filepath or not self.grid_item:
+            return
+            
         display_pixmap = self.get_channel_pixmap(self.current_filepath, self.view_mode)
+        
+        # Update the grid item
         self.grid_item.pixmap = display_pixmap
         self.grid_item.update()
 
     def get_channel_pixmap(self, filepath, mode):
-        if not filepath or not os.path.exists(filepath): return QPixmap()
-        if mode == "YCbCr": return QPixmap(filepath)
+        if not filepath or not os.path.exists(filepath):
+            return QPixmap()
+            
+        if mode == "YCbCr":
+            return QPixmap(filepath)
             
         try:
             img = Image.open(filepath)
@@ -1589,25 +2177,37 @@ class MainWindow(QMainWindow):
             channels = ycbcr.split()
             
             target_channel = None
-            if mode == "Y": target_channel = channels[0]
-            elif mode == "Cb": target_channel = channels[1]
-            elif mode == "Cr": target_channel = channels[2]
+            if mode == "Y":
+                target_channel = channels[0]
+            elif mode == "Cb":
+                target_channel = channels[1]
+            elif mode == "Cr":
+                target_channel = channels[2]
                     
             if target_channel:
                 img_data = target_channel.tobytes()
                 qimg = QImage(
-                    img_data, target_channel.size[0], target_channel.size[1], 
-                    target_channel.size[0], QImage.Format.Format_Grayscale8
+                    img_data, 
+                    target_channel.size[0], 
+                    target_channel.size[1], 
+                    target_channel.size[0], 
+                    QImage.Format.Format_Grayscale8
                 )
                 return QPixmap.fromImage(qimg)
+                
         except Exception as e:
             print(f"Error extracting channel pixmap: {e}", file=sys.stderr)
             
         return QPixmap(filepath)
 
     def show_view_context_menu(self, pos):
-        if not self.current_filepath: return
+        # Only show context menu if a file is loaded
+        if not self.current_filepath:
+            return
+            
         menu = QMenu(self.view)
+        
+        # Add the actions we defined earlier
         menu.addAction(self.action_ycbcr)
         menu.addSeparator()
         menu.addAction(self.action_y)
@@ -1615,19 +2215,24 @@ class MainWindow(QMainWindow):
         menu.addAction(self.action_cr)
         menu.addSeparator()
         
+        # Add View Hex option to context menu
         action_menu_hex = QAction("View Hex", self)
         action_menu_hex.triggered.connect(self.show_hex_viewer)
         menu.addAction(action_menu_hex)
         
+        # Add View EXIF option to context menu
         action_menu_exif = QAction("View EXIF Info", self)
         action_menu_exif.triggered.connect(self.show_exif_inspector)
         menu.addAction(action_menu_exif)
+        
         menu.exec(self.view.mapToGlobal(pos))
 
     def show_hex_viewer(self):
         if not self.current_filepath or not os.path.exists(self.current_filepath):
             QMessageBox.warning(self, "Warning", "Please load a JPEG file first.")
             return
+            
+        # Spawn the HexViewerDialog
         dialog = HexViewerDialog(self.current_filepath, self)
         dialog.exec()
 
@@ -1635,10 +2240,14 @@ class MainWindow(QMainWindow):
         if not self.current_filepath or not os.path.exists(self.current_filepath):
             QMessageBox.warning(self, "Warning", "Please load a JPEG file first.")
             return
+            
+        # Spawn the ExifInspectorDialog
         dialog = ExifInspectorDialog(self.current_filepath, self)
         dialog.exec()
 
+    # --- Reset GUI (Unchanged) ---
     def reset_gui(self):
+        # Reset Mini Labels
         self.current_file_label_mini.setText("No file loaded")
         self.dim_label_mini.setText("--- x ---")
         self.mcu_label_mini.setText("--- x ---")
@@ -1653,9 +2262,11 @@ class MainWindow(QMainWindow):
         self.original_filepath = None
         self.grid_item = None
         
+        # Clear Selection/Averge Info
         self.clear_mcu_info()
         self.avg_ycbr_label.setText("Y: ---, Cb: ---, Cr: ---")
         
+        # Disable all controls
         self.insert_button.setEnabled(False)
         self.delete_button.setEnabled(False)
         self.reset_button.setEnabled(False)
@@ -1667,27 +2278,36 @@ class MainWindow(QMainWindow):
         self.auto_align_button.setEnabled(False) 
         self.auto_color_button.setEnabled(False) 
         
+        # Reset SpinBox/Sliders
         self.mcu_block_num_input.setValue(1) 
         self.y_slider.setValue(0)
         self.cb_slider.setValue(0)
         self.cr_slider.setValue(0)
         
+        # Reset Batch UI
         self.progress_bar.setValue(0)
         self.output_text.clear()
+        
         self.selected_block_preview.set_active_state(False)
         self.clear_hover_info()
 
+    # --- Utility Methods (Unchanged) ---
     def toggle_grid_visibility(self):
         if self.grid_item:
             self.grid_item.grid_visible = not self.grid_item.grid_visible
             self.grid_item.update()
-            self.toggle_grid_button.setText("Hide MCU Grid" if self.grid_item.grid_visible else "Show MCU Grid")
+            
+            if self.grid_item.grid_visible:
+                self.toggle_grid_button.setText("Hide MCU Grid")
+            else:
+                self.toggle_grid_button.setText("Show MCU Grid")
         
     def open_file(self):
         filepath, _ = QFileDialog.getOpenFileName(
             self, "Open JPEG Image", os.path.expanduser("~"), "JPEG Files (*.jpg *.jpeg)"
         )
         if not filepath: return
+        
         self.original_filepath = filepath
         self.current_filepath = filepath
         self.load_and_display_image(filepath)
@@ -1705,6 +2325,7 @@ class MainWindow(QMainWindow):
         self.load_and_display_image(self.original_filepath)
         QMessageBox.information(self, "Reset", f"Successfully reloaded: {os.path.basename(self.original_filepath)}")
         
+        # Reset cdelta sliders and MCU Block Num
         self.mcu_block_num_input.setValue(1) 
         self.y_slider.setValue(0)
         self.cb_slider.setValue(0)
@@ -1716,7 +2337,14 @@ class MainWindow(QMainWindow):
             def pos(self): return QPointF(0, 0)
         return FakeMouseEvent()
     
+    # ======================================================================
+    # --- SINGLE-FILE REPAIR LOGIC (Unchanged) ---
+    # ======================================================================
     def get_repair_filepaths(self):
+        """
+        Determines input and output file paths for single-file operation.
+        The output file is always saved to 'Repaired/[Original Filename]' and OVERWRITES.
+        """
         base_path = self.original_filepath 
         if not base_path:
             return None, None
@@ -1731,22 +2359,23 @@ class MainWindow(QMainWindow):
             return None, None
             
         original_filename = os.path.basename(base_path)
-        output_file = os.path.normpath(os.path.abspath(os.path.join(repaired_dir, original_filename)))
-        input_file = os.path.normpath(os.path.abspath(self.current_filepath))
+        output_file = os.path.join(repaired_dir, original_filename)
+        input_file = self.current_filepath
         
-        return input_file, output_file[cite: 1]
+        return input_file, output_file
 
     def execute_jpegrepair(self, command, operation):
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        exe_path = os.path.normpath(os.path.join(script_dir, "jpegrepair.exe"))
+        exe_path = os.path.join(script_dir, "jpegrepair.exe")
 
         if not os.path.exists(exe_path):
             return False, f"Executable not found: {exe_path}. Ensure it is in the same folder as this script."
         
-        command.insert(0, exe_path)
+        command.insert(0, exe_path) 
         
         try:
             process = subprocess.run(command, capture_output=True, text=True, check=False)
+            
             if process.returncode == 0:
                 return True, ""
             else:
@@ -1756,12 +2385,14 @@ class MainWindow(QMainWindow):
         except Exception as e:
             return False, f"An unexpected error occurred during execution: {e}"
 
+    # --- Remove Gray Scanlines Method ---
     def remove_gray_scanlines(self):
         if not self.current_filepath or not self.current_mcu_data:
             QMessageBox.warning(self, "Warning", "Please load a JPEG file first.")
             return
 
         scanlines_to_remove = self.vertical_gray_scanlines_to_remove
+        
         if scanlines_to_remove <= 0:
             QMessageBox.information(self, "Info", "Zero gray MCU scanlines found. No cropping performed.")
             return
@@ -1770,26 +2401,32 @@ class MainWindow(QMainWindow):
         if not input_file: return
         
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        
         success = crop_jpeg_by_header(input_file, output_file, scanlines_to_remove)
+
         QApplication.restoreOverrideCursor()
 
         if success:
             QMessageBox.information(
-                self, "Success", 
+                self, 
+                "Success", 
                 f"Successfully cropped {scanlines_to_remove} gray MCU scanlines by modifying the JPEG header.<br>Output saved to: <b>{os.path.basename(output_file)}</b> (Overwritten)<br><br>Reloading view."
             )
             self.load_and_display_image(output_file) 
+            
             if self.auto_align_button.isEnabled():
                 QMessageBox.warning(self, "Post-Crop Check", f"Post-crop misalignment detected. <b>Auto Alignment is now enabled.</b>")
             else:
                 QMessageBox.information(self, "Post-Crop Check", "The crop fixed the issue. Auto Alignment not necessary.")
         else:
             QMessageBox.critical(
-                self, "Crop Failed", 
+                self, 
+                "Crop Failed", 
                 "Header modification failed. Check the console for more specific error details or file write permissions."
             )
             self.auto_align_button.setEnabled(False)
             
+    # --- Auto Alignment Method ---
     def run_auto_alignment(self):
         if not self.current_filepath or not self.current_mcu_data:
             QMessageBox.warning(self, "Warning", "Please load a JPEG file first.")
@@ -1799,7 +2436,11 @@ class MainWindow(QMainWindow):
         mcu_block_num = gray_count_remaining + 1
         
         if mcu_block_num <= 1:
-            QMessageBox.information(self, "Alignment Info", "Post-crop gray MCU count is 0. Auto Alignment not necessary.")
+            QMessageBox.information(
+                self, 
+                "Alignment Info", 
+                "Post-crop gray MCU count is 0. Auto Alignment not necessary."
+            )
             self.auto_align_button.setEnabled(False)
             return
 
@@ -1810,7 +2451,15 @@ class MainWindow(QMainWindow):
         input_file, output_file = self.get_repair_filepaths() 
         if not input_file: return
         
-        command = [input_file, output_file, "dest", str(c), str(r), "insert", str(mcu_block_num)]
+        command = [
+            input_file,
+            output_file,
+            "dest",
+            str(c), 
+            str(r),
+            "insert", 
+            str(mcu_block_num)
+        ]
         
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         success, error_msg = self.execute_jpegrepair(command, f"Auto Alignment ({operation})")
@@ -1818,7 +2467,8 @@ class MainWindow(QMainWindow):
         
         if success:
             QMessageBox.information(
-                self, "Auto Alignment Success", 
+                self, 
+                "Auto Alignment Success", 
                 f"Auto Alignment completed by inserting {mcu_block_num} blocks at MCU ({c}, {r}).<br>Output saved to: <b>{os.path.basename(output_file)}</b> (Overwritten)<br><br>Reloading view."
             )
             self.load_and_display_image(output_file)
@@ -1827,6 +2477,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Auto Alignment Failed", error_msg)
             self.auto_align_button.setEnabled(True) 
             
+    # --- Auto Color Correction Method (Pillow/PhotoDemon) ---
     def run_auto_color_correction(self):
         if not self.current_filepath:
             QMessageBox.warning(self, "Warning", "Please load a JPEG file first.")
@@ -1836,6 +2487,7 @@ class MainWindow(QMainWindow):
         if not input_file: return
 
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        
         try:
             original_img = Image.open(input_file)
             corrected_img = photodemon_autocorrect_image(original_img)
@@ -1849,36 +2501,43 @@ class MainWindow(QMainWindow):
 
         if success:
             QMessageBox.information(
-                self, "Auto-Correction Success", 
+                self, 
+                "Auto-Correction Success", 
                 f"PhotoDemon Auto Color/Lighting Correction applied.<br>Output saved to: <b>{os.path.basename(output_file)}</b> (Overwritten)<br><br>Reloading view."
             )
             self.load_and_display_image(output_file)
+            
+            # Reset CDelta sliders since this is a new color process
             self.y_slider.setValue(0)
             self.cb_slider.setValue(0)
             self.cr_slider.setValue(0)
+            
         else:
             QMessageBox.critical(self, "Auto-Correction Failed", error_msg)
 
+    # --- Run CDelta Repair Method ---
     def run_cdelta_repair(self):
         if not self.current_filepath:
             QMessageBox.warning(self, "Warning", "Please load a JPEG file first.")
             return
             
         deltas = {
-            0: self.y_slider.value(),
-            1: self.cb_slider.value(),
-            2: self.cr_slider.value()
+            0: self.y_slider.value(),   # Y
+            1: self.cb_slider.value(),  # Cb
+            2: self.cr_slider.value()   # Cr
         }
         
         if all(v == 0 for v in deltas.values()):
             QMessageBox.information(self, "Info", "All color corrections are set to 0. No operation executed.")
             return
 
+        # 1. Get the final desired output path
         _, final_output_file = self.get_repair_filepaths() 
         if not final_output_file: return
         
         active_components = [i for i, v in deltas.items() if v != 0]
 
+        # Setup temp file path for intermediate steps
         base_dir = os.path.dirname(final_output_file)
         ext = os.path.splitext(final_output_file)[1]
         temp_output_file = os.path.join(base_dir, f"temp_cdelta_{os.getpid()}{ext}")
@@ -1893,15 +2552,24 @@ class MainWindow(QMainWindow):
             for comp_index in active_components:
                 value = deltas[comp_index]
                 is_last_component = (comp_index == active_components[-1])
+                
                 output_path = final_output_file if is_last_component else temp_output_file
+                
                 operation = f"cdelta {comp_index} {value}"
                 
                 command = [
-                    current_input_file, output_path, "dest", 
-                    str(0), str(0), "cdelta", str(comp_index), str(value)
+                    current_input_file,
+                    output_path, 
+                    "dest",
+                    str(0), 
+                    str(0), 
+                    "cdelta",
+                    str(comp_index),
+                    str(value)
                 ]
                 
                 success, error_msg = self.execute_jpegrepair(command, operation)
+                
                 if not success:
                     all_successful = False
                     error_message = error_msg
@@ -1911,34 +2579,49 @@ class MainWindow(QMainWindow):
 
         finally:
             QApplication.restoreOverrideCursor()
+            # Clean up the temporary file if it was created and still exists
             if os.path.exists(temp_output_file):
                 os.remove(temp_output_file)
         
+        # 2. Final Load
         if all_successful:
             QMessageBox.information(
-                self, "Success", 
+                self, 
+                "Success", 
                 f"Color Correction (cdelta) completed. Output saved to: {os.path.basename(final_output_file)} (Overwritten)\n\nReloading view."
             )
             self.load_and_display_image(final_output_file)
+            
         else:
             QMessageBox.critical(
-                self, "Repair Failed", 
+                self, 
+                "Repair Failed", 
                 f"One or more color corrections failed.\n\nError:\n{error_message}"
             )
 
+    # --- Run Insert/Delete MCU Method ---
     def run_repair(self, operation):
         if not self.current_filepath:
             QMessageBox.warning(self, "Warning", "Please load a JPEG file first.")
             return
 
         mcu_block_num = self.mcu_block_num_input.value()
+        
         c = getattr(self, 'selected_mcu_c', 0)
         r = getattr(self, 'selected_mcu_r', 0)
         
         input_file, output_file = self.get_repair_filepaths()
         if not input_file: return
         
-        command = [input_file, output_file, "dest", str(c), str(r), operation, str(mcu_block_num)]
+        command = [
+            input_file,
+            output_file,
+            "dest",
+            str(c), 
+            str(r),
+            operation,
+            str(mcu_block_num)
+        ]
         
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         success, error_msg = self.execute_jpegrepair(command, operation)
@@ -1946,13 +2629,19 @@ class MainWindow(QMainWindow):
         
         if success:
             QMessageBox.information(
-                self, "Success", 
+                self, 
+                "Success", 
                 f"MCU {operation} completed. Output saved to: {os.path.basename(output_file)} (Overwritten)\n\nReloading view."
             )
             self.load_and_display_image(output_file)
         else:
             QMessageBox.critical(self, "Repair Failed", error_msg)
 
+    # ======================================================================
+    # --- BATCH PROCESSING LOGIC (NEW) ---
+    # ======================================================================
+
+    # --- Button Callbacks (Provided by user) ---
     def selectReferenceJPEG(self):
         fileName, _ = QFileDialog.getOpenFileName(self, "Select Reference JPEG", "", "JPEG Files (*.jpg *.jpeg);;All Files (*)")
         if fileName:
@@ -1963,6 +2652,7 @@ class MainWindow(QMainWindow):
         if folderName:
             self.encrypted_folder_input.setText(folderName)
 
+    # --- User's File Manipulation Helpers ---
     def find_ffda_offset(self, data):
         ffda_marker = b'\xFF\xDA'
         ffda_offset = data.rfind(ffda_marker)
@@ -1975,13 +2665,13 @@ class MainWindow(QMainWindow):
         while i < len(data) - 1:
             if data[i] == 0xFF:
                 marker = data[i:i+2]
-                if marker == b'\xFF\xE1':
+                if marker == b'\xFF\xE1': # APP1 (EXIF) marker
                     length = int.from_bytes(data[i+2:i+4], 'big') + 2
                     data = data[:i] + data[i+length:]
                     continue
-                elif marker == b'\xFF\xDA':
-                    break
-                elif marker not in (b'\xFF\xD8', b'\xFF\xD9'):
+                elif marker == b'\xFF\xDA': # SOS (Start of Scan) marker
+                    break # Stop parsing, we've reached the entropy-coded scan data!
+                elif marker not in (b'\xFF\xD8', b'\xFF\xD9'): # Not SOI or EOI
                     if len(data) < i + 4: break
                     try:
                         length = int.from_bytes(data[i+2:i+4], 'big') + 2
@@ -1993,6 +2683,7 @@ class MainWindow(QMainWindow):
         return data
 
     def _initial_file_manipulation(self, reference_path, encrypted_path, output_path):
+        """Initial merge/cleaning step using user-provided fixed offsets."""
         with open(encrypted_path, 'rb') as encrypted_file:
             encrypted_data = encrypted_file.read()
 
@@ -2000,6 +2691,7 @@ class MainWindow(QMainWindow):
             reference_data = reference_file.read()
 
         ffda_offset = self.find_ffda_offset(reference_data)
+        # Use fixed offsets provided by the user's process_jpeg logic
         cut_reference_data = reference_data[:ffda_offset + 12]
         
         repaired_data = cut_reference_data + encrypted_data[153605:]
@@ -2009,26 +2701,32 @@ class MainWindow(QMainWindow):
         with open(output_path, 'wb') as output_file:
             output_file.write(repaired_data)
 
+    # --- Internal Batch Repair Helpers ---
+
     def _batch_step_header_crop(self, input_path, output_path):
+        """1. Remove MCU Gray Scanlines - Batch Version"""
         mcu_data = get_jpeg_mcu_data(input_path)
         if not mcu_data: return False, f"Error: Cannot read MCU data from {os.path.basename(input_path)}."
 
         vertical_gray_count, _, _ = count_gray_mcu_scanlines(input_path, mcu_data)
+        
         if vertical_gray_count <= 0:
             shutil.copy2(input_path, output_path)
             return True, output_path
             
         success = crop_jpeg_by_header(input_path, output_path, vertical_gray_count)
+
         if success:
             return True, output_path
         else:
             return False, f"Failed to crop {vertical_gray_count} scanlines."
 
     def _batch_step_auto_align(self, input_path, output_path):
+        """2. Auto Alignment (Insert Blocks at Header) - Batch Version"""
         mcu_data = get_jpeg_mcu_data(input_path)
         if not mcu_data: 
-            shutil.copy2(input_path, output_path)
-            return True, output_path
+            shutil.copy2(input_path, output_path) # Copy to ensure file exists for next step
+            return True, output_path # Alignment not possible/needed
         
         horizontal_gray_mcu_count = analyze_last_scanline_mcus(input_path, mcu_data)
         mcu_block_num = horizontal_gray_mcu_count + 1
@@ -2037,7 +2735,10 @@ class MainWindow(QMainWindow):
             shutil.copy2(input_path, output_path)
             return True, output_path
 
-        command = [input_path, output_path, "dest", str(0), str(0), "insert", str(mcu_block_num)]
+        command = [
+            input_path, output_path, "dest", str(0), str(0), "insert", str(mcu_block_num)
+        ]
+        
         success, error_msg = self.execute_jpegrepair(command, f"Auto Align ({mcu_block_num} blocks)")
         
         if success:
@@ -2046,6 +2747,7 @@ class MainWindow(QMainWindow):
             return False, error_msg
 
     def _batch_step_auto_color(self, input_path, output_path):
+        """3. Apply PhotoDemon WB + Clarity - Batch Version"""
         try:
             original_img = Image.open(input_path)
             corrected_img = photodemon_autocorrect_image(original_img)
@@ -2055,9 +2757,12 @@ class MainWindow(QMainWindow):
             return False, f"Failed to apply PhotoDemon Auto-Correction (WB/Clarity): {e}"
 
     def process_jpeg_batch(self, input_file, reference_path, output_file):
+        """Chains the full three-step repair for a single file in the batch."""
         base_dir = os.path.dirname(output_file)
+        # Use unique PID temp file to manage intermediate results
         temp_pre_process_file = os.path.join(base_dir, f"temp_pre_process_{os.getpid()}_{os.path.basename(input_file)}")
         
+        # 1. Initial Merge/Clean (User's original logic)
         try:
             self._initial_file_manipulation(reference_path, input_file, temp_pre_process_file)
         except Exception as e:
@@ -2067,32 +2772,38 @@ class MainWindow(QMainWindow):
         temp_files_to_cleanup = [temp_pre_process_file]
         
         try:
+            # 2. Header Crop
             temp_crop_file = os.path.join(base_dir, f"temp_batch_{os.getpid()}_crop.jpg")
             success, result = self._batch_step_header_crop(current_input_file, temp_crop_file)
             if not success: return False, f"Header Crop failed: {result}"
             current_input_file = result
             temp_files_to_cleanup.append(temp_crop_file)
             
+            # 3. Auto Alignment
             temp_align_file = os.path.join(base_dir, f"temp_batch_{os.getpid()}_align.jpg")
             success, result = self._batch_step_auto_align(current_input_file, temp_align_file)
             if not success: return False, f"Auto Alignment failed: {result}"
             current_input_file = result
             temp_files_to_cleanup.append(temp_align_file)
             
+            # 4. Auto Color Correction (Final Step - outputs to final path)
             success, result = self._batch_step_auto_color(current_input_file, output_file)
             if not success: return False, f"Auto Color failed: {result}"
             
             return True, output_file
             
         finally:
+            # Cleanup all intermediate files
             for f in temp_files_to_cleanup:
                 if os.path.exists(f): 
                     try:
                         os.remove(f)
                     except Exception:
-                        pass
+                        pass # Ignore cleanup errors
+
 
     def repairJPEGs(self):
+        """Main batch loop provided by the user, modified to use chained repair logic."""
         reference_jpeg = self.reference_jpeg_input.text().strip()
         encrypted_folder = self.encrypted_folder_input.text().strip()
 
@@ -2103,6 +2814,7 @@ class MainWindow(QMainWindow):
         repaired_folder = os.path.join(encrypted_folder, "Repaired")
         os.makedirs(repaired_folder, exist_ok=True)
         
+        # Pattern from user's request
         pattern = re.compile(r".*\.JPG\..{4}$", re.I)
         encrypted_files = [f for f in os.listdir(encrypted_folder) if pattern.match(f)]
         
@@ -2115,21 +2827,26 @@ class MainWindow(QMainWindow):
         self.output_text.clear()
         
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        
         successful_count = 0
         total_count = len(encrypted_files)
 
         try:
             for i, encrypted_file in enumerate(encrypted_files):
+                # Calculate the final output name based on user's original logic
                 input_file_path = os.path.join(encrypted_folder, encrypted_file)
                 output_name = os.path.splitext(encrypted_file)[0].rsplit('.', 1)[0] + '.JPG'
                 output_file_path = os.path.join(repaired_folder, output_name)
                 
                 self.output_text.append(f"Starting: {encrypted_file} -> {output_name}")
+                
                 success, result_path_or_error = self.process_jpeg_batch(input_file_path, reference_jpeg, output_file_path)
                 
                 if success:
                     self.output_text.append(f"  SUCCESS: All 3 steps completed.")
                     successful_count += 1
+                    
+                    # Auto load the image when processed, as requested by the user
                     self.original_filepath = output_file_path
                     self.load_and_display_image(output_file_path) 
                 else:
@@ -2142,7 +2859,8 @@ class MainWindow(QMainWindow):
             
         self.output_text.append(f"\nBatch Repair complete. {successful_count} of {total_count} files successfully processed.")
         QMessageBox.information(
-            self, "Batch Complete", 
+            self, 
+            "Batch Complete", 
             f"Batch Repair finished.<br>Processed: <b>{total_count}</b><br>Successful: <b>{successful_count}</b>"
         )
 
@@ -2152,6 +2870,7 @@ class MainWindow(QMainWindow):
             self.view.fitInView(self.grid_item, Qt.AspectRatioMode.KeepAspectRatio)
 
 
+# --- Run the Application ---
 if __name__ == '__main__':
     if hasattr(sys, 'frozen') and sys.platform == 'win32':
         qt_plugin_path = os.path.join(os.path.dirname(sys.executable), 'PyQt6', 'Qt6', 'plugins')
@@ -2160,6 +2879,7 @@ if __name__ == '__main__':
              
     app = QApplication(sys.argv)
     
+    # Establish a reliable global application font and size for High-DPI scaling
     app_font = app.font()
     app_font.setFamily("Segoe UI")
     app_font.setPointSize(10)
@@ -2174,32 +2894,31 @@ import os
 import subprocess
 import shutil
 import numpy as np
-import re
+import re # ADDED: For file pattern matching in batch process
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, 
     QGridLayout, QLabel, QPushButton, QFileDialog,
     QMessageBox, QGraphicsView, QGraphicsScene, QGraphicsItem,
     QLineEdit, QHBoxLayout, QSlider, QFrame, QGroupBox, QTabWidget,
-    QSpinBox, QTextEdit, QProgressBar, QScrollArea, QMenu, QDialog, 
-    QListWidget, QTableWidget, QTableWidgetItem, QHeaderView
+    QSpinBox, # ADDED: QSpinBox
+    QTextEdit, # ADDED: For batch process log
+    QProgressBar # ADDED: For batch process progress
 )
-from PyQt6.QtGui import QPainter, QColor, QPen, QPixmap, QPalette, QMouseEvent, QFont, QImage, QAction
+from PyQt6.QtGui import QPainter, QColor, QPen, QPixmap, QPalette, QMouseEvent
 from PyQt6.QtCore import Qt, QRectF, QRect, QPointF, QBuffer, QIODevice
 
 # --- Pillow Import ---
 try:
     from PIL import Image
-    from PIL.ExifTags import TAGS
 except ImportError:
     class PillowStub:
         @staticmethod
         def open(path): raise ImportError("Pillow not installed. Please run 'pip install Pillow'")
     Image = PillowStub
-    TAGS = {}
 
 
 # ======================================================================
-# --- JPEG HEADER & SCANLINE LOGIC ---
+# --- JPEG HEADER & SCANLINE LOGIC (Utility functions remain the same) ---
 # ======================================================================
 
 def get_jpeg_mcu_data(filepath):
@@ -2213,6 +2932,7 @@ def get_jpeg_mcu_data(filepath):
                 marker = f.read(2)
                 if not marker: return None
                 
+                # Check for SOF0 (Baseline DCT) or SOF2 (Progressive DCT)
                 if marker in (b'\xff\xc0', b'\xff\xc2'):
                     length_bytes = f.read(2)
                     if len(length_bytes) < 2: return None
@@ -2223,6 +2943,7 @@ def get_jpeg_mcu_data(filepath):
                     if len(sof_data) != (segment_length - 2): return None
                     break
                 
+                # Skip other markers (0xFFXX where XX is not D8, D9, DA)
                 if marker[0] == 0xff and marker[1] not in (0x00, 0xd8, 0xd9, 0xda):
                     segment_length = struct.unpack('>H', f.read(2))[0]
                     f.seek(segment_length - 2, 1)
@@ -2230,17 +2951,23 @@ def get_jpeg_mcu_data(filepath):
                 else: f.seek(-1, 1)
 
             height_y, width_x = struct.unpack('>HH', sof_data[1:5])
+            
+            # Simplified component check for common YCbCr 4:2:0/4:4:4
             num_components = sof_data[5]
 
+            # Assume 3 components (Y, Cb, Cr)
             if num_components != 3: return None
             
+            # Read Y component sampling factor byte (index 7 from SOF data)
             y_sampling_factor_byte = sof_data[7]
             y_hor = (y_sampling_factor_byte >> 4) & 0x0F
             y_ver = y_sampling_factor_byte & 0x0F
             
+            # MCU size in pixels
             mcu_x = y_hor * 8
             mcu_y = y_ver * 8
             
+            # Number of MCUs required to cover the width/height
             n_mcu_x = (width_x + mcu_x - 1) // mcu_x
             n_mcu_y = (height_y + mcu_y - 1) // mcu_y
             
@@ -2253,13 +2980,17 @@ def get_jpeg_mcu_data(filepath):
         return None
 
 def is_mcu_scanline_gray(pixels, gray_tolerance=10, color_std_dev_threshold=5):
-    """Checks if a 2D array of YCbCr pixels is gray using NumPy."""
+    """
+    Checks if a 2D array of YCbCr pixels (whether full scanline or single MCU) is gray using NumPy.
+    """
     if pixels.size == 0:
         return False
 
+    # Check the Cb and Cr components (indices 1 and 2)
     Cb = pixels[:, 1]
     Cr = pixels[:, 2]
 
+    # Chrominance Neutrality Check: Max deviation from 128 (neutral)
     cb_deviation = np.abs(Cb.astype(int) - 128)
     cr_deviation = np.abs(Cr.astype(int) - 128)
     
@@ -2267,14 +2998,19 @@ def is_mcu_scanline_gray(pixels, gray_tolerance=10, color_std_dev_threshold=5):
     max_cr_dev = np.max(cr_deviation)
     is_color_neutral = (max_cb_dev <= gray_tolerance) and (max_cr_dev <= gray_tolerance)
     
+    # Chrominance Uniformity Check: Low standard deviation
     std_cb = np.std(Cb)
     std_cr = np.std(Cr)
     is_color_uniform = (std_cb <= color_std_dev_threshold) and (std_cr <= color_std_dev_threshold)
     
     return is_color_neutral and is_color_uniform
 
+# --- FIXED: Iterates backward to find contiguous gray blocks at the footer ---
 def count_gray_mcu_scanlines(filepath, mcu_data, gray_tolerance=10, color_std_dev_threshold=5, skip_top_scanlines=1):
-    """Counts contiguous gray MCU scanlines from the bottom of the image."""
+    """
+    Counts contiguous gray MCU scanlines from the bottom of the image.
+    Skips the first 'skip_top_scanlines' scanlines to avoid false positives at the top.
+    """
     if not mcu_data:
         return 0, 0, []
 
@@ -2288,6 +3024,7 @@ def count_gray_mcu_scanlines(filepath, mcu_data, gray_tolerance=10, color_std_de
         gray_scanline_count = 0
         gray_scanline_indices = []
 
+        # Iterate backward through MCU scanlines, skipping the top ones
         for i in range(total_mcu_scanlines - 1, skip_top_scanlines - 1, -1):
             start_row = i * mcu_y
             end_row = min((i + 1) * mcu_y, height)
@@ -2297,18 +3034,24 @@ def count_gray_mcu_scanlines(filepath, mcu_data, gray_tolerance=10, color_std_de
 
             if is_mcu_scanline_gray(pixels, gray_tolerance, color_std_dev_threshold):
                 gray_scanline_count += 1
-                gray_scanline_indices.insert(0, i)
+                gray_scanline_indices.insert(0, i)  # Keep indices in ascending order
             else:
+                # Stop when encountering the first non-gray scanline from the bottom
                 break
 
         return gray_scanline_count, total_mcu_scanlines, gray_scanline_indices
 
     except Exception as e:
+        # If an error occurs, return 0 and log the error
         print(f"Error in count_gray_mcu_scanlines: {e}")
         return 0, 0, []
         
+        
 def analyze_last_scanline_mcus(filepath, mcu_data, gray_tolerance=10, color_std_dev_threshold=5):
-    """Analyzes the individual MCUs in the last vertical scanline of the image."""
+    """
+    (Used for Auto Alignment) Analyzes the individual MCUs in the last vertical scanline 
+    of the image to count 'Gray MCUs Found' (horizontal analysis).
+    """
     if not mcu_data:
         return 0
 
@@ -2331,13 +3074,16 @@ def analyze_last_scanline_mcus(filepath, mcu_data, gray_tolerance=10, color_std_
 
         gray_mcu_count = 0
 
+        # Iterate horizontally across MCUs in the last scanline
         for i in range(n_mcu_x):
             start_col = i * mcu_x
             end_col = min((i + 1) * mcu_x, width)
 
+            # Extract the current MCU block
             mcu_block = img_array[start_row:end_row, start_col:end_col, :]
             pixels = mcu_block.reshape(-1, 3)
 
+            # Check if the MCU block is gray
             if is_mcu_scanline_gray(pixels, gray_tolerance, color_std_dev_threshold):
                 gray_mcu_count += 1
                 
@@ -2345,6 +3091,8 @@ def analyze_last_scanline_mcus(filepath, mcu_data, gray_tolerance=10, color_std_
         
     except Exception:
         return 0
+
+# --- PhotoDemon Clarity Lookup Table Generator ---
 
 def _clarity_lookup_table():
     """Generates the PhotoDemon 'Clarity/Midtone Contrast' lookup table."""
@@ -2361,18 +3109,24 @@ def _clarity_lookup_table():
             push = ((255.0 - x_float) / 127.0) * (diff / 2.0) * factor
             
         gray = x_float + push
+        
+        # Crop the lookup value to [0, 255] range
         gray = np.clip(gray, 0, 255)
+            
         contrastLookup[x] = int(round(gray))
         
     return contrastLookup
 
+# --- Combined PhotoDemon Auto-Correction Logic (WB + Clarity) ---
 def photodemon_autocorrect_image(img: Image.Image) -> Image.Image:
     """Applies PhotoDemon's primary auto-correction steps: WB and Midtone Contrast."""
+    
     if img.mode != 'RGB':
         img = img.convert('RGB')
         
     np_img = np.array(img, dtype=np.uint8)
     
+    # 1. White Balance (Independent Channel Histogram Stretch, 0.05% threshold)
     r, g, b = np_img[:, :, 0], np_img[:, :, 1], np_img[:, :, 2]
     low_clip = 0.05
     high_clip = 100.0 - 0.05
@@ -2393,10 +3147,13 @@ def photodemon_autocorrect_image(img: Image.Image) -> Image.Image:
         
     np_img = np.stack(corrected_channels, axis=2)
     
+    # 2. Clarity/Midtone Contrast (Lookup Table Application)
     clarity_lookup = _clarity_lookup_table()
-    np_img[:, :, 0] = clarity_lookup[np_img[:, :, 0]]
-    np_img[:, :, 1] = clarity_lookup[np_img[:, :, 1]]
-    np_img[:, :, 2] = clarity_lookup[np_img[:, :, 2]]
+    
+    # Apply lookup table to all channels
+    np_img[:, :, 0] = clarity_lookup[np_img[:, :, 0]] # Red
+    np_img[:, :, 1] = clarity_lookup[np_img[:, :, 1]] # Green
+    np_img[:, :, 2] = clarity_lookup[np_img[:, :, 2]] # Blue
     
     return Image.fromarray(np_img, 'RGB')
 
@@ -2405,7 +3162,10 @@ def photodemon_autocorrect_image(img: Image.Image) -> Image.Image:
 # ======================================================================
 
 def find_sof_height_position(filepath):
-    """Scans the JPEG file to find the byte position of the Height field."""
+    """
+    Scans the JPEG file to find the byte position of the Height field
+    within the SOF segment (0xFFC0 or 0xFFC2).
+    """
     if not os.path.exists(filepath): return None
     
     try:
@@ -2416,6 +3176,8 @@ def find_sof_height_position(filepath):
                 if not marker: return None
                 
                 if marker in (b'\xff\xc0', b'\xff\xc2'):
+                    # The height field is 5 bytes after the SOF marker
+                    # 2 bytes for marker, 2 bytes for length, 1 byte for precision
                     return marker_pos + 5 
                 
                 if marker[0] == 0xff and marker[1] not in (0x00, 0xd8, 0xd9, 0xda):
@@ -2427,7 +3189,10 @@ def find_sof_height_position(filepath):
         return None
 
 def crop_jpeg_by_header(source_filepath, output_filepath, scanlines_to_remove):
-    """Copies the source file and modifies the Height field in the SOF segment."""
+    """
+    Copies the source file and modifies the Height field in the SOF segment
+    of the new file based on the number of MCU scanlines to remove.
+    """
     mcu_data = get_jpeg_mcu_data(source_filepath)
 
     if not mcu_data:
@@ -2441,7 +3206,7 @@ def crop_jpeg_by_header(source_filepath, output_filepath, scanlines_to_remove):
     calculated_new_height = original_height - pixels_to_remove
     
     if calculated_new_height <= 0 or calculated_new_height >= original_height:
-        print(f"Error: Invalid crop. New height ({calculated_new_height}) is not smaller than original or is zero/negative.", file=sys.stderr)
+        print(f"Error: Invalid crop. New height ({calculated_new_height}) is not smaller than original or is zero/negative. Aborting.", file=sys.stderr)
         return False
 
     try:
@@ -2467,6 +3232,7 @@ def crop_jpeg_by_header(source_filepath, output_filepath, scanlines_to_remove):
     except Exception as e:
         print(f"An error occurred during header modification of the new file: {e}", file=sys.stderr)
         return False
+
 
 # ======================================================================
 # --- UTILITY MCU FUNCTIONS ---
@@ -2494,10 +3260,11 @@ def get_mcu_avg_ycbr_values(filepath, mcu_data, r, c):
         return None
 
 # ======================================================================
-# --- PyQt GUI Components & Main Window ---
+# --- PyQt GUI Components ---
 # ======================================================================
 
 class McuGridItem(QGraphicsItem):
+    # (Unchanged)
     def __init__(self, mcu_data, image_pixmap, main_window):
         super().__init__()
         self.main_window = main_window
@@ -2537,23 +3304,26 @@ class McuGridItem(QGraphicsItem):
             hx = hc * self.mcu_x
             hy = hr * self.mcu_y
             h_rect = QRectF(hx, hy, self.mcu_x, self.mcu_y)
-            painter.fillRect(h_rect, QColor(88, 166, 255, 60)) 
+            painter.fillRect(h_rect, QColor(0, 119, 255, 60)) 
         
         if self.selected_mcu_coords:
             r, c = self.selected_mcu_coords
+            
             x = c * self.mcu_x
             y = r * self.mcu_y
             w = self.mcu_x
             h = self.mcu_y
+            
             highlight_rect = QRectF(x, y, w, h)
             
-            painter.fillRect(highlight_rect, QColor(255, 123, 114, 70)) 
-            painter.setPen(QPen(QColor(255, 123, 114), 3)) 
+            painter.fillRect(highlight_rect, QColor(255, 60, 60, 70)) 
+            painter.setPen(QPen(QColor(255, 60, 60), 3)) 
             painter.drawRect(highlight_rect)
     
     def _calculate_mcu_coords(self, pos):
         c = int(pos.x() // self.mcu_x)
         r = int(pos.y() // self.mcu_y)
+        
         c = max(0, min(c, self.n_mcu_x - 1))
         r = max(0, min(r, self.n_mcu_y - 1)) 
         return r, c
@@ -2603,6 +3373,7 @@ class McuGridItem(QGraphicsItem):
             self.main_window.display_mcu_info(new_r, new_c)
 
 class McuGraphicsView(QGraphicsView):
+    # (Unchanged)
     def __init__(self, scene, parent=None):
         super().__init__(scene, parent)
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
@@ -2617,12 +3388,13 @@ class McuGraphicsView(QGraphicsView):
         else:
             self.scale(1.0 / zoom_factor, 1.0 / zoom_factor)
 
+
 class BlockPreviewWidget(QWidget):
+    
+    CELL_SIZE = 8
+    
     def __init__(self, cols=16, rows=8, is_static_preview=False, parent=None):
         super().__init__(parent)
-        logical_dpi = QApplication.primaryScreen().logicalDotsPerInch()
-        dpi_scale = logical_dpi / 96.0
-        self.CELL_SIZE = int(8 * dpi_scale)
         self.rows = rows
         self.cols = cols
         self.is_static_preview = is_static_preview 
@@ -2647,7 +3419,8 @@ class BlockPreviewWidget(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.fillRect(self.rect(), QColor(22, 27, 34)) 
+        
+        painter.fillRect(self.rect(), QColor(45, 45, 55)) 
 
         if not self.mcu_pixmap.isNull():
             painter.drawPixmap(
@@ -2661,23 +3434,24 @@ class BlockPreviewWidget(QWidget):
                     y = r * self.CELL_SIZE + 1
                     rect = QRect(x, y, self.CELL_SIZE, self.CELL_SIZE)
                     if (r + c) % 2 == 0:
-                        painter.fillRect(rect, QColor(33, 38, 45)) 
+                        painter.fillRect(rect, QColor(50, 50, 60)) 
                     else:
-                        painter.fillRect(rect, QColor(13, 17, 23))
+                        painter.fillRect(rect, QColor(40, 40, 50))
 
-        grid_line_color = QColor(48, 54, 61) 
+        grid_line_color = QColor(60, 60, 70) 
         painter.setPen(QPen(grid_line_color, 1)) 
         for r in range(self.rows + 1):
             painter.drawLine(1, r * self.CELL_SIZE + 1, self.cols * self.CELL_SIZE + 1, r * self.CELL_SIZE + 1)
         for c in range(self.cols + 1):
             painter.drawLine(c * self.CELL_SIZE + 1, 1, c * self.CELL_SIZE + 1, self.rows * self.CELL_SIZE + 1)
         
-        default_pen = QPen(QColor(48, 54, 61), 1)
+        default_pen = QPen(QColor(80, 80, 90), 1)
+        
         if self.is_static_preview and self.is_hovered:
-            painter.setPen(QPen(QColor(88, 166, 255), 2)) 
+            painter.setPen(QPen(QColor(0, 119, 255), 2)) 
             painter.drawRect(0, 0, self.width()-1, self.height()-1)
         elif not self.is_static_preview and self.is_selected:
-            painter.setPen(QPen(QColor(255, 123, 114), 2)) 
+            painter.setPen(QPen(QColor(255, 60, 60), 2)) 
             painter.drawRect(0, 0, self.width()-1, self.height()-1)
         else:
             painter.setPen(default_pen)
@@ -2693,394 +3467,11 @@ class BlockPreviewWidget(QWidget):
             self.is_hovered = is_hovered
             self.update()
 
-# ======================================================================
-# --- Hex & EXIF Dialogs ---
-# ======================================================================
 
-def scan_jpeg_markers(filepath):
-    markers = []
-    if not filepath or not os.path.exists(filepath):
-        return markers
-    try:
-        with open(filepath, 'rb') as f:
-            data = f.read()
-        i = 0
-        while i < len(data) - 1:
-            if data[i] == 0xFF:
-                marker_type = data[i+1]
-                if marker_type not in (0x00, 0xFF):
-                    if 0xD0 <= marker_type <= 0xD7:
-                        i += 2
-                        continue
-                    marker_name = "Unknown"
-                    if marker_type == 0xD8: marker_name = "SOI (Start of Image)"
-                    elif marker_type == 0xD9: marker_name = "EOI (End of Image)"
-                    elif marker_type == 0xDA: marker_name = "SOS (Start of Scan)"
-                    elif marker_type == 0xDB: marker_name = "DQT (Quantization Table)"
-                    elif marker_type == 0xC4: marker_name = "DHT (Huffman Table)"
-                    elif marker_type in (0xC0, 0xC1, 0xC2, 0xC3): 
-                        marker_name = f"SOF{marker_type - 0xC0} (Frame Header)"
-                    elif 0xE0 <= marker_type <= 0xEF:
-                        marker_name = f"APP{marker_type - 0xE0} Metadata"
-                    elif marker_type == 0xFE: marker_name = "COM (Comment)"
-                    
-                    markers.append({
-                        'offset': i,
-                        'name': marker_name,
-                        'bytes': f"FF {marker_type:02X}"
-                    })
-                    if marker_type not in (0xD8, 0xD9, 0x01) and not (0xD0 <= marker_type <= 0xD7):
-                        if i + 3 < len(data):
-                            length = int.from_bytes(data[i+2:i+4], 'big')
-                            i += length + 2
-                            continue
-            i += 1
-    except Exception as e:
-        print(f"Error scanning JPEG markers: {e}", file=sys.stderr)
-    return markers
-
-class HexViewerDialog(QDialog):
-    def __init__(self, filepath, parent=None):
-        super().__init__(parent)
-        self.filepath = filepath
-        self.offset = 0
-        self.chunk_size = 2048
-        self.total_size = os.path.getsize(filepath) if filepath and os.path.exists(filepath) else 0
-        self.scanned_markers = scan_jpeg_markers(filepath)
-        self.init_ui()
-        self.load_hex_chunk()
-
-    def init_ui(self):
-        self.setWindowTitle(f"Hex Viewer - {os.path.basename(self.filepath)}")
-        self.resize(850, 580)
-        self.setMinimumSize(800, 450)
-        self.setStyleSheet("""
-            QDialog { background-color: #0d1117; }
-            QLabel { color: #c9d1d9; font-family: 'Segoe UI'; font-size: 10pt; }
-            QLineEdit { background-color: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 4px; padding: 4px; font-size: 9.5pt; }
-            QLineEdit:focus { border: 1px solid #58a6ff; }
-            QPushButton { background-color: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 4px; padding: 6px 12px; font-weight: bold; font-size: 9.5pt; }
-            QPushButton:hover { background-color: #30363d; }
-            QPushButton:disabled { background-color: #0d1117; color: #8b949e; border-color: #30363d; }
-            QListWidget { background-color: #161b22; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; font-family: 'Segoe UI'; font-size: 9.5pt; padding: 4px; }
-            QListWidget::item { padding: 6px; border-radius: 4px; }
-            QListWidget::item:hover { background-color: #21262d; }
-            QListWidget::item:selected { background-color: #21262d; color: #58a6ff; font-weight: bold; }
-        """)
-        layout = QVBoxLayout(self)
-        top_bar = QHBoxLayout()
-        self.info_label = QLabel("Offset: 0x00000000 / 0x00000000 (0.00 MB)")
-        top_bar.addWidget(self.info_label)
-        top_bar.addStretch(1)
-        top_bar.addWidget(QLabel("Go to Offset:"))
-        self.jump_input = QLineEdit()
-        self.jump_input.setPlaceholderText("e.g. 0xDA, 256")
-        self.jump_input.setFixedWidth(120)
-        self.jump_input.returnPressed.connect(self.jump_to_offset)
-        top_bar.addWidget(self.jump_input)
-        self.jump_button = QPushButton("Go")
-        self.jump_button.clicked.connect(self.jump_to_offset)
-        top_bar.addWidget(self.jump_button)
-        layout.addLayout(top_bar)
-        
-        self.diagnostic_label = QLabel()
-        self.run_diagnostics()
-        layout.addWidget(self.diagnostic_label)
-        
-        split_layout = QHBoxLayout()
-        sidebar_layout = QVBoxLayout()
-        sidebar_layout.addWidget(QLabel("<b>JPEG Marker Directory:</b>"))
-        self.marker_list = QListWidget()
-        self.marker_list.setFixedWidth(240)
-        self.populate_marker_directory()
-        self.marker_list.itemClicked.connect(self.marker_directory_clicked)
-        sidebar_layout.addWidget(self.marker_list)
-        split_layout.addLayout(sidebar_layout)
-        
-        self.text_box = QTextEdit()
-        self.text_box.setReadOnly(True)
-        self.text_box.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
-        self.text_box.setStyleSheet("""
-            QTextEdit {
-                background-color: #0d1117; color: #c9d1d9; border: 1px solid #30363d;
-                border-radius: 6px; font-family: 'Consolas', 'Courier New', monospace;
-                font-size: 10pt; padding: 8px;
-            }
-        """)
-        split_layout.addWidget(self.text_box, 1)
-        layout.addLayout(split_layout)
-        
-        bottom_bar = QHBoxLayout()
-        self.prev_button = QPushButton("← Prev 2KB")
-        self.prev_button.clicked.connect(self.prev_page)
-        bottom_bar.addWidget(self.prev_button)
-        self.next_button = QPushButton("Next 2KB →")
-        self.next_button.clicked.connect(self.next_page)
-        bottom_bar.addWidget(self.next_button)
-        bottom_bar.addStretch(1)
-        
-        legend = QLabel(
-            "Legend: "
-            "<span style='color:#58a6ff;'><b>SOI</b></span> | "
-            "<span style='color:#ff7b72;'><b>EOI</b></span> | "
-            "<span style='color:#7ee787;'><b>SOS</b></span> | "
-            "<span style='color:#d2a8ff;'><b>DHT/DQT</b></span> | "
-            "<span style='color:#ffb454;'><b>SOF</b></span>"
-        )
-        bottom_bar.addWidget(legend)
-        bottom_bar.addStretch(1)
-        
-        close_button = QPushButton("Close")
-        close_button.clicked.connect(self.accept)
-        bottom_bar.addWidget(close_button)
-        layout.addLayout(bottom_bar)
-
-    def run_diagnostics(self):
-        errors, warnings = [], []
-        if not self.scanned_markers:
-            errors.append("Invalid JPEG: 0 structural markers identified.")
-        else:
-            if not any(m['bytes'] == "FF D8" for m in self.scanned_markers):
-                errors.append("Missing SOI (Start of Image) marker at start of file.")
-            elif self.scanned_markers[0]['bytes'] != "FF D8":
-                warnings.append("SOI is not the very first marker in the file.")
-            if not any(m['bytes'] == "FF DB" for m in self.scanned_markers):
-                errors.append("Missing DQT (Quantization Table) structure.")
-            if not any(m['bytes'] == "FF C4" for m in self.scanned_markers):
-                warnings.append("Missing DHT (Huffman Table) structure.")
-            sof_markers = [m for m in self.scanned_markers if m['bytes'] in ("FF C0", "FF C1", "FF C2", "FF C3")]
-            if not sof_markers:
-                errors.append("Missing SOF (Start of Frame) header.")
-            if not any(m['bytes'] == "FF DA" for m in self.scanned_markers):
-                errors.append("Missing SOS (Start of Scan) block.")
-            if not any(m['bytes'] == "FF D9" for m in self.scanned_markers):
-                errors.append("Missing EOI (End of Image) terminator.")
-                
-        if errors:
-            status_text = f"<span style='color:#ff7b72;'><b>✖ Diagnostics:</b> {errors[0]}</span>"
-        elif warnings:
-            status_text = f"<span style='color:#ffb454;'><b>⚠ Diagnostics:</b> {warnings[0]}</span>"
-        else:
-            status_text = "<span style='color:#7ee787;'><b>✔ Diagnostics:</b> Healthy JPEG structure verified.</span>"
-        self.diagnostic_label.setText(status_text)
-
-    def populate_marker_directory(self):
-        self.marker_list.clear()
-        for marker in self.scanned_markers:
-            item_text = f"{marker['bytes']}  {marker['name']} (0x{marker['offset']:04X})"
-            self.marker_list.addItem(item_text)
-
-    def marker_directory_clicked(self, item):
-        row = self.marker_list.row(item)
-        if 0 <= row < len(self.scanned_markers):
-            self.offset = self.scanned_markers[row]['offset']
-            self.load_hex_chunk()
-
-    def load_hex_chunk(self):
-        if not self.filepath or not os.path.exists(self.filepath):
-            self.text_box.setHtml("<span style='color:#ff7b72;'>Error: File not found or invalid path.</span>")
-            return
-        self.offset = max(0, min(self.offset, self.total_size - 1))
-        self.offset = (self.offset // 16) * 16
-        try:
-            with open(self.filepath, 'rb') as f:
-                f.seek(self.offset)
-                data = f.read(self.chunk_size)
-            html_dump = self.generate_hex_dump_html(data, self.offset)
-            self.text_box.setHtml(html_dump)
-            total_size_mb = self.total_size / (1024 * 1024)
-            self.info_label.setText(f"Offset: <b>0x{self.offset:08X}</b> / 0x{self.total_size:08X} ({total_size_mb:.2f} MB)")
-            self.prev_button.setEnabled(self.offset > 0)
-            self.next_button.setEnabled(self.offset + self.chunk_size < self.total_size)
-        except Exception as e:
-            self.text_box.setHtml(f"<span style='color:#ff7b72;'>Error loading hex data: {e}</span>")
-
-    def prev_page(self):
-        self.offset -= self.chunk_size
-        self.load_hex_chunk()
-
-    def next_page(self):
-        self.offset += self.chunk_size
-        self.load_hex_chunk()
-
-    def jump_to_offset(self):
-        text = self.jump_input.text().strip()
-        if not text: return
-        try:
-            target = int(text, 16) if text.lower().startswith("0x") else int(text, 10)
-            if 0 <= target < self.total_size:
-                self.offset = target
-                self.load_hex_chunk()
-                self.jump_input.clear()
-            else:
-                QMessageBox.warning(self, "Invalid Offset", f"Offset must be between 0 and {self.total_size - 1}.")
-        except ValueError:
-            QMessageBox.warning(self, "Invalid Format", "Please enter a valid decimal number or hex offset starting with '0x'.")
-
-    def generate_hex_dump_html(self, data, start_offset=0):
-        html_lines = [
-            "<span style='color: #8b949e;'>Offset    00 01 02 03 04 05 06 07  08 09 0A 0B 0C 0D 0E 0F  Decoded Text</span>",
-            "<span style='color: #30363d;'>------------------------------------------------------------------</span>"
-        ]
-        for i in range(0, len(data), 16):
-            chunk = data[i:i+16]
-            offset_str = f"{start_offset + i:08X}"
-            hex_parts, ascii_parts = [], []
-            j = 0
-            while j < 16:
-                if j < len(chunk):
-                    b = chunk[j]
-                    is_marker, marker_color = False, None
-                    if b == 0xFF and j + 1 < len(chunk):
-                        next_b = chunk[j+1]
-                        if next_b not in (0x00, 0xFF):
-                            is_marker = True
-                            if next_b == 0xD8: marker_color = "#58a6ff"
-                            elif next_b == 0xD9: marker_color = "#ff7b72"
-                            elif next_b == 0xDA: marker_color = "#7ee787"
-                            elif next_b in (0xDB, 0xC4): marker_color = "#d2a8ff"
-                            elif next_b in (0xC0, 0xC2): marker_color = "#ffb454"
-                            else: marker_color = "#ffa198"
-                    if is_marker:
-                        b1, b2 = chunk[j], chunk[j+1]
-                        hex_parts.append(f"<span style='color: {marker_color}; font-weight: bold;'>{b1:02X}</span>")
-                        hex_parts.append(f"<span style='color: {marker_color}; font-weight: bold;'>{b2:02X}</span>")
-                        for b_val in (b1, b2):
-                            char = chr(b_val) if 32 <= b_val < 127 else "."
-                            ascii_parts.append(f"<span style='color: {marker_color}; font-weight: bold;'>{char}</span>")
-                        j += 2
-                        if j == 8: hex_parts.append("")
-                        continue
-                    else:
-                        char = chr(b) if 32 <= b < 127 else "."
-                        hex_parts.append(f"{b:02X}")
-                        ascii_parts.append(char)
-                else:
-                    hex_parts.append("  ")
-                    ascii_parts.append(" ")
-                j += 1
-                if j == 8: hex_parts.append("")
-            hex_str1 = " ".join(hex_parts[:8])
-            hex_str2 = " ".join(hex_parts[8:])
-            hex_full = f"{hex_str1}  {hex_str2}"
-            ascii_clean = "".join([("&lt;" if c == "<" else "&gt;" if c == ">" else "&amp;" if c == "&" else str(c)) for c in ascii_parts])
-            html_lines.append(f"<span style='color: #8b949e;'>{offset_str}</span>  {hex_full}  <span style='color: #8b949e;'>|</span><span style='color: #c9d1d9;'>{ascii_clean}</span><span style='color: #8b949e;'>|</span>")
-        return "<pre style='margin: 0; font-family: \"Consolas\", \"Courier New\", monospace;'>" + "<br>".join(html_lines) + "</pre>"
-
-class ExifInspectorDialog(QDialog):
-    def __init__(self, filepath, parent=None):
-        super().__init__(parent)
-        self.filepath = filepath
-        self.exif_data = []
-        self.init_ui()
-        self.load_exif_data()
-
-    def init_ui(self):
-        self.setWindowTitle(f"EXIF Metadata Inspector - {os.path.basename(self.filepath)}")
-        self.resize(650, 480)
-        self.setMinimumSize(550, 350)
-        self.setStyleSheet("""
-            QDialog { background-color: #0d1117; }
-            QLabel { color: #c9d1d9; font-family: 'Segoe UI'; font-size: 10pt; }
-            QLineEdit { background-color: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 4px; padding: 6px; font-size: 9.5pt; }
-            QLineEdit:focus { border: 1px solid #58a6ff; }
-            QPushButton { background-color: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 4px; padding: 6px 12px; font-weight: bold; font-size: 9.5pt; }
-            QPushButton:hover { background-color: #30363d; }
-            QTableWidget { background-color: #161b22; color: #c9d1d9; gridline-color: #30363d; border: 1px solid #30363d; border-radius: 6px; font-family: 'Segoe UI'; font-size: 9.5pt; }
-            QTableWidget::item { padding: 6px; }
-            QHeaderView::section { background-color: #21262d; color: #58a6ff; padding: 6px; font-weight: bold; border: 1px solid #30363d; }
-        """)
-        layout = QVBoxLayout(self)
-        search_layout = QHBoxLayout()
-        search_layout.addWidget(QLabel("Search Metadata:"))
-        self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("Filter tag names or values...")
-        self.search_input.textChanged.connect(self.filter_exif_table)
-        search_layout.addWidget(self.search_input)
-        layout.addLayout(search_layout)
-        
-        self.table = QTableWidget()
-        self.table.setColumnCount(3)
-        self.table.setHorizontalHeaderLabels(["Tag Name", "Hex ID", "Decoded Value"])
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        self.table.horizontalHeader().setStretchLastSection(True)
-        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.table.setAlternatingRowColors(True)
-        self.table.setStyleSheet("QTableWidget { alternate-background-color: #0d1117; }")
-        layout.addWidget(self.table)
-        
-        bottom_bar = QHBoxLayout()
-        self.status_label = QLabel("Loading metadata...")
-        bottom_bar.addWidget(self.status_label)
-        bottom_bar.addStretch(1)
-        close_button = QPushButton("Close")
-        close_button.clicked.connect(self.accept)
-        bottom_bar.addWidget(close_button)
-        layout.addLayout(bottom_bar)
-
-    def load_exif_data(self):
-        if not self.filepath or not os.path.exists(self.filepath):
-            self.status_label.setText("Error: File not found.")
-            return
-        try:
-            img = Image.open(self.filepath)
-            exif = img._getexif()
-            if not exif:
-                self.table.setRowCount(0)
-                self.status_label.setText("No EXIF metadata found in this JPEG APP1 header.")
-                return
-            self.exif_data = []
-            for tag_id, value in exif.items():
-                tag_name = TAGS.get(tag_id, f"Unknown (Tag {tag_id})")
-                hex_id = f"0x{tag_id:04X}"
-                if isinstance(value, bytes):
-                    try:
-                        clean_val = value.decode('utf-8', errors='ignore').strip().replace('\x00', '')
-                    except Exception:
-                        clean_val = f"Binary Data ({len(value)} bytes)"
-                else:
-                    clean_val = str(value)
-                self.exif_data.append((tag_name, hex_id, clean_val))
-            self.exif_data.sort(key=lambda x: x[0])
-            self.populate_table(self.exif_data)
-            self.status_label.setText(f"Found {len(self.exif_data)} metadata records.")
-            self.table.setColumnWidth(0, 180)
-            self.table.setColumnWidth(1, 80)
-        except Exception as e:
-            self.status_label.setText(f"Error reading metadata: {e}")
-
-    def populate_table(self, data_list):
-        self.table.setRowCount(len(data_list))
-        for row_idx, (name, hex_id, value) in enumerate(data_list):
-            item_name = QTableWidgetItem(name)
-            item_hex = QTableWidgetItem(hex_id)
-            item_val = QTableWidgetItem(value)
-            item_hex.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.table.setItem(row_idx, 0, item_name)
-            self.table.setItem(row_idx, 1, item_hex)
-            self.table.setItem(row_idx, 2, item_val)
-
-    def filter_exif_table(self, query):
-        query = query.strip().lower()
-        if not query:
-            self.populate_table(self.exif_data)
-            self.status_label.setText(f"Found {len(self.exif_data)} metadata records.")
-            return
-        filtered = [(n, h, v) for n, h, v in self.exif_data if query in n.lower() or query in v.lower() or query in h.lower()]
-        self.populate_table(filtered)
-        self.status_label.setText(f"Matches: {len(filtered)} of {len(self.exif_data)}")
-
-# ======================================================================
-# --- MainWindow Implementation ---
-# ======================================================================
-
+# --- Main Window ---
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        logical_dpi = QApplication.primaryScreen().logicalDotsPerInch()
-        self.dpi_scale = logical_dpi / 96.0
-        
         self.setWindowTitle("JPEG MCU Repair Tool")
         self.setGeometry(100, 100, 1200, 800) 
         self.current_mcu_data = None
@@ -3092,61 +3483,16 @@ class MainWindow(QMainWindow):
         self.scene = QGraphicsScene()
         self.view = McuGraphicsView(self.scene)
         self.grid_item = None
-        self.view_mode = "YCbCr"
-        
-        self.view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.view.customContextMenuRequested.connect(self.show_view_context_menu)
-        
-        self.action_ycbcr = QAction("YCbCr", self)
-        self.action_ycbcr.setShortcut("Ctrl+0")
-        self.action_ycbcr.setCheckable(True)
-        self.action_ycbcr.setChecked(True)
-        self.action_ycbcr.triggered.connect(lambda: self.set_view_mode("YCbCr"))
-        self.addAction(self.action_ycbcr)
-        
-        self.action_y = QAction("Y", self)
-        self.action_y.setShortcut("Ctrl+1")
-        self.action_y.setCheckable(True)
-        self.action_y.triggered.connect(lambda: self.set_view_mode("Y"))
-        self.addAction(self.action_y)
-        
-        self.action_cb = QAction("Cb", self)
-        self.action_cb.setShortcut("Ctrl+2")
-        self.action_cb.setCheckable(True)
-        self.action_cb.triggered.connect(lambda: self.set_view_mode("Cb"))
-        self.addAction(self.action_cb)
-        
-        self.action_cr = QAction("Cr", self)
-        self.action_cr.setShortcut("Ctrl+3")
-        self.action_cr.setCheckable(True)
-        self.action_cr.triggered.connect(lambda: self.set_view_mode("Cr"))
-        self.addAction(self.action_cr)
-        
-        self.action_view_hex = QAction("View Hex", self)
-        self.action_view_hex.setShortcut("Ctrl+H")
-        self.action_view_hex.triggered.connect(self.show_hex_viewer)
-        self.addAction(self.action_view_hex)
-        
-        self.action_view_exif = QAction("View EXIF Info", self)
-        self.action_view_exif.setShortcut("Ctrl+E")
-        self.action_view_exif.triggered.connect(self.show_exif_inspector)
-        self.addAction(self.action_view_exif)
         
         central_widget = QWidget()
         outer_layout = QHBoxLayout(central_widget)
 
+        # --- Left/Main Content Area ---
         left_content_layout = QVBoxLayout()
         left_content_layout.addWidget(self.view)
         outer_layout.addLayout(left_content_layout, 1) 
 
-        self.scroll_area = QScrollArea()
-        self.scroll_area.setWidgetResizable(True)
-        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
-        self.scroll_area.setObjectName("RightPanelScroll")
-        self.scroll_area.setMinimumWidth(int(340 * self.dpi_scale))
-
+        # --- Right Panel (Controls) ---
         right_panel_widget = QWidget()
         right_panel_layout = QVBoxLayout(right_panel_widget)
         right_panel_layout.setContentsMargins(10, 10, 10, 10)
@@ -3172,17 +3518,8 @@ class MainWindow(QMainWindow):
         self.toggle_grid_button.setEnabled(False) 
         pm_layout.addWidget(self.toggle_grid_button)
         
-        self.view_hex_button = QPushButton("View Hex")
-        self.view_hex_button.clicked.connect(self.show_hex_viewer)
-        self.view_hex_button.setEnabled(False)
-        pm_layout.addWidget(self.view_hex_button)
-        
-        self.view_exif_button = QPushButton("View EXIF")
-        self.view_exif_button.clicked.connect(self.show_exif_inspector)
-        self.view_exif_button.setEnabled(False)
-        pm_layout.addWidget(self.view_exif_button)
-        
         pm_layout.addWidget(QFrame(frameShape=QFrame.Shape.HLine)) 
+        
         pm_layout.addWidget(QLabel("Current File:"))
         self.current_file_label_mini = QLabel("No file loaded")
         pm_layout.addWidget(self.current_file_label_mini)
@@ -3192,6 +3529,7 @@ class MainWindow(QMainWindow):
         pm_layout.addWidget(QLabel("MCU Size:"))
         self.mcu_label_mini = QLabel("--- x ---")
         pm_layout.addWidget(self.mcu_label_mini)
+        
         project_management_group.setLayout(pm_layout)
         right_panel_layout.addWidget(project_management_group)
         
@@ -3204,37 +3542,43 @@ class MainWindow(QMainWindow):
 
         self.pixel_block_preview = BlockPreviewWidget(cols=16, rows=8, is_static_preview=True)
         self.selected_block_preview = BlockPreviewWidget(cols=16, rows=8, is_static_preview=False) 
+        
         previews_layout.addWidget(self.pixel_block_preview, 1, 0)
         previews_layout.addWidget(self.selected_block_preview, 1, 1)
+
         mcu_previews_group.setLayout(previews_layout)
         right_panel_layout.addWidget(mcu_previews_group)
         
-        # 3. Tabs
+        # 3. Tab Widget for Repair/Color Correction
+        
+        # --- Repair Tab ---
         repair_tab = QWidget()
         repair_layout = QVBoxLayout(repair_tab)
         repair_layout.setContentsMargins(0, 0, 0, 0) 
         
+        # MCU Repair
         mcu_repair_group = QGroupBox("MCU Edit")
         mcu_repair_layout = QGridLayout()
         mcu_repair_layout.setContentsMargins(10, 20, 10, 10)
+        
         mcu_repair_layout.addWidget(QLabel("MCU Block:"), 0, 0)
         
         self.mcu_block_num_input = QSpinBox() 
         self.mcu_block_num_input.setRange(1, 1000) 
         self.mcu_block_num_input.setValue(1) 
-        self.mcu_block_num_input.setFixedWidth(int(70 * self.dpi_scale)) 
+        self.mcu_block_num_input.setFixedWidth(70) 
         mcu_repair_layout.addWidget(self.mcu_block_num_input, 0, 1)
         
         self.insert_button = QPushButton("Insert MCU")
         self.insert_button.clicked.connect(lambda: self.run_repair("insert"))
         self.insert_button.setEnabled(False)
         mcu_repair_layout.addWidget(self.insert_button, 0, 2)
-        
         self.delete_button = QPushButton("Delete MCU")
         self.delete_button.clicked.connect(lambda: self.run_repair("delete"))
         self.delete_button.setEnabled(False)
         mcu_repair_layout.addWidget(self.delete_button, 0, 3)
 
+        # Header Crop Analysis 
         mcu_repair_layout.addWidget(QLabel("Gray Scanlines Found:"), 1, 0)
         self.gray_scanline_count_label_mini = QLabel("--- / --- (0%)")
         mcu_repair_layout.addWidget(self.gray_scanline_count_label_mini, 1, 1, 1, 3)
@@ -3253,10 +3597,13 @@ class MainWindow(QMainWindow):
         repair_layout.addWidget(mcu_repair_group)
         repair_layout.addStretch(1)
 
+
+        # --- Color Correction Tab ---
         color_tab = QWidget()
         color_layout = QVBoxLayout(color_tab)
         color_layout.setContentsMargins(0, 0, 0, 0) 
         
+        # Manual Color Adjustment
         manual_color_group = QGroupBox("Manual Color")
         manual_color_layout = QVBoxLayout()
         manual_color_layout.setContentsMargins(10, 20, 10, 10)
@@ -3265,14 +3612,14 @@ class MainWindow(QMainWindow):
         def create_slider(label_text):
             h_layout = QHBoxLayout()
             label = QLabel(f"{label_text}:")
-            label.setFixedWidth(int(30 * self.dpi_scale)) 
+            label.setFixedWidth(30) 
             slider = QSlider(Qt.Orientation.Horizontal)
             slider.setRange(MIN_VAL, MAX_VAL)
             slider.setValue(DEFAULT_VAL)
             slider.setSingleStep(1)
             slider.setPageStep(64)
             value_label = QLabel(str(DEFAULT_VAL).rjust(5))
-            value_label.setFixedWidth(int(65 * self.dpi_scale)) 
+            value_label.setFixedWidth(50) 
             slider.setObjectName(f"{label_text.lower()}_slider") 
             slider.valueChanged.connect(lambda v, l=value_label: l.setText(str(v).rjust(5)))
             h_layout.addWidget(label)
@@ -3292,30 +3639,34 @@ class MainWindow(QMainWindow):
         self.cdelta_button.clicked.connect(self.run_cdelta_repair)
         self.cdelta_button.setEnabled(False)
         manual_color_layout.addWidget(self.cdelta_button)
+        
         manual_color_group.setLayout(manual_color_layout)
         color_layout.addWidget(manual_color_group)
 
+        # Automatic Color Correction
         auto_color_group = QGroupBox("Auto color")
         auto_color_layout = QVBoxLayout()
         auto_color_layout.setContentsMargins(10, 20, 10, 10)
+        
         self.auto_color_button = QPushButton("Apply")
         self.auto_color_button.setObjectName("AccentButton") 
         self.auto_color_button.clicked.connect(self.run_auto_color_correction)
         self.auto_color_button.setEnabled(False)
         auto_color_layout.addWidget(self.auto_color_button) 
+        
         auto_color_group.setLayout(auto_color_layout)
         color_layout.addWidget(auto_color_group)
         color_layout.addStretch(1) 
         
+        # --- NEW: Batch Processing Tab ---
         batch_tab = QWidget()
         batch_layout = QVBoxLayout(batch_tab)
         batch_layout.setContentsMargins(10, 10, 10, 10)
+        
         batch_group = QGroupBox("Batch")
         batch_grid = QGridLayout()
-        batch_grid.setColumnStretch(0, 0)
-        batch_grid.setColumnStretch(1, 1)
-        batch_grid.setColumnStretch(2, 0)
         
+        # 1. Reference JPEG Path
         batch_grid.addWidget(QLabel("Reference JPEG:"), 0, 0)
         self.reference_jpeg_input = QLineEdit()
         self.reference_jpeg_input.setPlaceholderText("Select a known good JPEG file...")
@@ -3324,6 +3675,7 @@ class MainWindow(QMainWindow):
         self.select_ref_button.clicked.connect(self.selectReferenceJPEG)
         batch_grid.addWidget(self.select_ref_button, 0, 2)
         
+        # 2. Encrypted Folder Path
         batch_grid.addWidget(QLabel("Encrypted Folder:"), 1, 0)
         self.encrypted_folder_input = QLineEdit()
         self.encrypted_folder_input.setPlaceholderText("Select folder containing encrypted files...")
@@ -3332,6 +3684,7 @@ class MainWindow(QMainWindow):
         self.select_folder_button.clicked.connect(self.selectEncryptedFolder)
         batch_grid.addWidget(self.select_folder_button, 1, 2)
         
+        # 3. Process Button
         self.auto_batch_process_button = QPushButton("Start")
         self.auto_batch_process_button.setObjectName("PrimaryButton")
         self.auto_batch_process_button.clicked.connect(self.repairJPEGs)
@@ -3340,26 +3693,29 @@ class MainWindow(QMainWindow):
         batch_group.setLayout(batch_grid)
         batch_layout.addWidget(batch_group)
         
+        # 4. Progress and Output
         self.progress_bar = QProgressBar(self)
         batch_layout.addWidget(self.progress_bar)
         
         self.output_text = QTextEdit()
         self.output_text.setReadOnly(True)
         self.output_text.setObjectName("OutputText")
-        self.output_text.setFont(QFont("Consolas", 10))
         batch_layout.addWidget(QLabel("Log:"))
         batch_layout.addWidget(self.output_text, 1)
         
+        # Tab Widget container
         self.tab_widget = QTabWidget()
         self.tab_widget.addTab(repair_tab, "Repair")
         self.tab_widget.addTab(color_tab, "Color")
-        self.tab_widget.addTab(batch_tab, "Batch")
+        self.tab_widget.addTab(batch_tab, "Batch") # ADDED BATCH TAB
+        
         right_panel_layout.addWidget(self.tab_widget)
         
-        # 4. MCU Info
+        # 4. Selected MCU Information
         selection_info_group = QGroupBox("MCU Info")
         selection_layout = QGridLayout()
         selection_layout.setContentsMargins(10, 20, 10, 10)
+        
         selection_layout.addWidget(QLabel("MCU Address:"), 0, 0)
         self.mcu_coords_label = QLabel("--")
         selection_layout.addWidget(self.mcu_coords_label, 0, 1)
@@ -3378,101 +3734,256 @@ class MainWindow(QMainWindow):
         
         selection_info_group.setLayout(selection_layout)
         right_panel_layout.addWidget(selection_info_group)
-        right_panel_layout.addStretch(1) 
         
-        self.scroll_area.setWidget(right_panel_widget)
-        outer_layout.addWidget(self.scroll_area)
+        right_panel_layout.addStretch(1) 
+        outer_layout.addWidget(right_panel_widget)
+        
         self.setCentralWidget(central_widget)
+        
+        # Apply the dark theme
         self.apply_dark_theme()
-
+        
+    # --- Dark Theme Implementation (Unchanged) ---
     def apply_dark_theme(self):
-        BG_DARK, BG_MID, BG_LIGHT = "#0d1117", "#161b22", "#21262d"
-        TEXT_COLOR, TEXT_MUTED = "#c9d1d9", "#8b949e"
-        ACCENT_BLUE, ACCENT_BLUE_GLOW = "#58a6ff", "#79c0ff"
-        ACCENT_RED, ACCENT_RED_GLOW = "#ff7b72", "#ffa198"
-        ACCENT_GREEN, ACCENT_GREEN_GLOW = "#3fb950", "#56d364"
-        BORDER_GRAY, BORDER_LIGHT = "#30363d", "#484f58"
-
+        
+        BG_DARK = "#282c36"     
+        BG_MID = "#21252b"      
+        BG_LIGHT = "#3b404d"    
+        TEXT_COLOR = "#abb2bf"  
+        ACCENT_BLUE = "#0077ff" 
+        ACCENT_RED = "#ff3c4a"  
+        BORDER_GRAY = "#4d515a" 
+        
         palette = QPalette()
         palette.setColor(QPalette.ColorRole.Window, QColor(BG_DARK))
         palette.setColor(QPalette.ColorRole.WindowText, QColor(TEXT_COLOR))
-        palette.setColor(QPalette.ColorRole.Base, QColor(BG_MID))
+        palette.setColor(QPalette.ColorRole.Base, QColor(BG_LIGHT))
         palette.setColor(QPalette.ColorRole.Text, QColor(TEXT_COLOR))
         palette.setColor(QPalette.ColorRole.Button, QColor(BG_LIGHT))
         palette.setColor(QPalette.ColorRole.ButtonText, QColor(TEXT_COLOR))
         palette.setColor(QPalette.ColorRole.Highlight, QColor(ACCENT_BLUE))
         palette.setColor(QPalette.ColorRole.HighlightedText, QColor(Qt.GlobalColor.white))
         QApplication.setPalette(palette)
-
+        
         style_sheet = f"""
-        * {{ font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, Helvetica, Arial, sans-serif; font-size: 10pt; }}
-        QMainWindow {{ background-color: {BG_DARK}; }}
-        QWidget#RightPanel {{ background-color: {BG_DARK}; border-left: 1px solid {BORDER_GRAY}; }}
-        QGroupBox {{ font-weight: bold; font-size: 10pt; color: {TEXT_COLOR}; background-color: {BG_MID}; border: 1px solid {BORDER_GRAY}; border-radius: 8px; margin-top: 18px; padding: 10px; }}
-        QGroupBox::title {{ subcontrol-origin: margin; subcontrol-position: top left; padding: 2px 10px; left: 10px; font-size: 9pt; text-transform: uppercase; letter-spacing: 1px; color: {ACCENT_BLUE}; background-color: {BG_DARK}; border: 1px solid {BORDER_GRAY}; border-radius: 4px; }}
-        QLabel {{ color: {TEXT_COLOR}; font-size: 10pt; padding: 2px 0; }}
-        QTextEdit#OutputText {{ background-color: {BG_DARK}; color: #7ee787; border: 1px solid {BORDER_GRAY}; border-radius: 6px; padding: 8px; font-size: 10pt; }}
-        QLineEdit, QSpinBox {{ background-color: {BG_LIGHT}; color: {TEXT_COLOR}; border: 1px solid {BORDER_GRAY}; border-radius: 6px; padding: 6px; font-size: 10pt; selection-background-color: {ACCENT_BLUE}; }}
-        QLineEdit:focus, QSpinBox:focus {{ border: 1px solid {ACCENT_BLUE}; }}
-        QPushButton {{ background-color: {BG_LIGHT}; color: {TEXT_COLOR}; border: 1px solid {BORDER_GRAY}; border-radius: 6px; padding: 8px 12px; font-weight: bold; font-size: 10pt; }}
-        QPushButton:hover {{ background-color: {BORDER_GRAY}; border-color: {BORDER_LIGHT}; }}
-        QPushButton:pressed {{ background-color: {BORDER_LIGHT}; }}
-        QPushButton:disabled {{ background-color: {BG_DARK}; border-color: {BORDER_GRAY}; color: {TEXT_MUTED}; }}
-        QPushButton#PrimaryButton {{ background-color: {ACCENT_BLUE}; color: {BG_DARK}; border: none; font-weight: bold; font-size: 10pt; padding: 10px; }}
-        QPushButton#PrimaryButton:hover {{ background-color: {ACCENT_BLUE_GLOW}; }}
-        QPushButton#SecondaryButton {{ background-color: {ACCENT_RED}; color: {BG_DARK}; border: none; font-weight: bold; font-size: 10pt; }}
-        QPushButton#SecondaryButton:hover {{ background-color: {ACCENT_RED_GLOW}; }}
-        QPushButton#AccentButton {{ background-color: {ACCENT_GREEN}; color: {BG_DARK}; border: none; font-weight: bold; font-size: 10pt; }}
-        QPushButton#AccentButton:hover {{ background-color: {ACCENT_GREEN_GLOW}; }}
-        QSlider::groove:horizontal {{ border: 1px solid {BORDER_GRAY}; height: 6px; background: {BG_DARK}; border-radius: 3px; }}
-        QSlider::handle:horizontal {{ background: {ACCENT_BLUE}; border: 1px solid {BORDER_GRAY}; width: 14px; height: 14px; margin: -4px 0; border-radius: 7px; }}
-        QTabWidget::pane {{ border: 1px solid {BORDER_GRAY}; background-color: {BG_MID}; border-radius: 8px; top: -1px; }}
-        QTabBar::tab {{ background: {BG_DARK}; color: {TEXT_MUTED}; padding: 8px 16px; border: 1px solid {BORDER_GRAY}; border-bottom: none; border-top-left-radius: 6px; border-top-right-radius: 6px; margin-right: 2px; text-transform: uppercase; font-weight: bold; font-size: 9pt; }}
-        QTabBar::tab:selected {{ background: {BG_MID}; color: {ACCENT_BLUE}; border-bottom: 2px solid {ACCENT_BLUE}; }}
-        QTabBar::tab:hover {{ background: {BG_LIGHT}; color: {TEXT_COLOR}; }}
-        QProgressBar {{ border: 1px solid {BORDER_GRAY}; border-radius: 6px; text-align: center; color: {TEXT_COLOR}; background-color: {BG_DARK}; font-weight: bold; font-size: 9pt; height: 18px; }}
-        QProgressBar::chunk {{ background-color: {ACCENT_BLUE}; border-radius: 5px; }}
-        QGraphicsView {{ border: 1px solid {BORDER_GRAY}; background-color: {BG_DARK}; border-radius: 8px; }}
-        QScrollArea#RightPanelScroll {{ border: none; background-color: {BG_DARK}; }}
-        QScrollBar:vertical {{ border: none; background: {BG_DARK}; width: 8px; }}
-        QScrollBar::handle:vertical {{ background: {BORDER_GRAY}; min-height: 20px; border-radius: 4px; }}
-        QScrollBar::handle:vertical:hover {{ background: {ACCENT_BLUE}; }}
-        QMenu {{ background-color: {BG_MID}; color: {TEXT_COLOR}; border: 1px solid {BORDER_GRAY}; border-radius: 6px; padding: 4px 0px; }}
-        QMenu::item {{ padding: 6px 24px 6px 20px; background-color: transparent; }}
-        QMenu::item:selected {{ background-color: {BG_LIGHT}; color: {ACCENT_BLUE}; }}
-        QMenu::separator {{ height: 1px; background-color: {BORDER_GRAY}; margin: 4px 0px; }}
+        QMainWindow {{
+            background-color: {BG_DARK};
+        }}
+
+        QWidget#RightPanel {{
+            background-color: {BG_MID};
+        }}
+        
+        QGroupBox {{
+            font-weight: bold;
+            color: {TEXT_COLOR};
+            border: 1px solid {BORDER_GRAY};
+            border-radius: 6px;
+            margin-top: 10px;
+        }}
+        
+        QGroupBox::title {{
+            subcontrol-origin: margin;
+            subcontrol-position: top left;
+            padding: 0 3px;
+            left: 10px;
+            color: {TEXT_COLOR};
+            background-color: {BG_MID};
+        }}
+
+        QLabel {{
+            color: {TEXT_COLOR};
+            padding: 2px 0;
+        }}
+        
+        QTextEdit#OutputText {{
+            background-color: {BG_LIGHT};
+            color: {TEXT_COLOR};
+            border: 1px solid {BORDER_GRAY};
+            border-radius: 4px;
+            padding: 5px;
+        }}
+
+        QLineEdit, QSpinBox {{
+            background-color: {BG_LIGHT};
+            color: {TEXT_COLOR};
+            border: 1px solid {BORDER_GRAY};
+            border-radius: 4px;
+            padding: 5px;
+            selection-background-color: {ACCENT_BLUE};
+        }}
+
+        /* --- SpinBox Specific Styles --- */
+        QSpinBox::up-button, QSpinBox::down-button {{
+            width: 16px; 
+            border: 1px solid {BORDER_GRAY};
+            border-radius: 2px;
+            background-color: #4a5160;
+        }}
+        QSpinBox::up-button:hover, QSpinBox::down-button:hover {{
+            background-color: #555d6e;
+        }}
+        QSpinBox::up-arrow {{
+            image: url(data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMjQiIGhlaWdodD0iMjQiIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTEyIDhMMTYgMTJIOEwxMiA4WiIgZmlsbD0iI2FiYjJiZiIvPgo8L3N2Zz4=);
+        }}
+        QSpinBox::down-arrow {{
+            image: url(data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMjQiIGhlaWdodD0iMjQiIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTEyIDE2TDE2IDEySDhMMTIgMTZaIiBmaWxsPSIjYWJiMmJmIi8+Cjwvc3ZnPg==);
+        }}
+
+        /* --- Buttons --- */
+        QPushButton {{
+            background-color: {BG_LIGHT};
+            color: {TEXT_COLOR};
+            border: none;
+            border-radius: 4px;
+            padding: 8px;
+            margin: 4px 0;
+        }}
+
+        QPushButton:hover {{
+            background-color: #4a5160;
+        }}
+
+        QPushButton:pressed {{
+            background-color: #555d6e;
+        }}
+        
+        QPushButton:disabled {{
+            background-color: #33363d;
+            color: #6c717a;
+        }}
+
+        /* Primary Button (Open/Submit - Accent Blue) */
+        QPushButton#PrimaryButton {{
+            background-color: {ACCENT_BLUE};
+            color: white;
+            font-weight: bold;
+            padding: 10px;
+        }}
+        QPushButton#PrimaryButton:hover {{
+            background-color: #3d9dff;
+        }}
+        
+        /* Secondary Button (Apply CDelta - Accent Red) */
+        QPushButton#SecondaryButton {{
+            background-color: {ACCENT_RED};
+            color: white;
+            font-weight: bold;
+        }}
+        QPushButton#SecondaryButton:hover {{
+            background-color: #ff606b;
+        }}
+
+        /* Accent Button (Auto Color - Soft Green/Yellow) */
+        QPushButton#AccentButton {{
+            background-color: #4e825a; 
+            color: white;
+            font-weight: bold;
+        }}
+        QPushButton#AccentButton:hover {{
+            background-color: #63a26f;
+        }}
+        
+        /* --- Sliders --- */
+        QSlider::groove:horizontal {{
+            border: 1px solid {BORDER_GRAY};
+            height: 8px;
+            background: {BG_LIGHT};
+            margin: 2px 0;
+            border-radius: 4px;
+        }}
+        
+        QSlider::handle:horizontal {{
+            background: {ACCENT_BLUE};
+            border: none;
+            width: 14px;
+            margin: -3px 0;
+            border-radius: 7px;
+        }}
+        
+        /* --- Tab Widget --- */
+        QTabWidget::pane {{ 
+            border: 1px solid {BORDER_GRAY};
+            background-color: {BG_MID};
+            padding: 1px;
+            border-radius: 6px;
+        }}
+        
+        QTabBar::tab {{
+            background: {BG_LIGHT};
+            color: {TEXT_COLOR};
+            padding: 8px 15px;
+            border: 1px solid {BORDER_GRAY};
+            border-bottom: none; 
+            border-top-left-radius: 4px;
+            border-top-right-radius: 4px;
+        }}
+        
+        QTabBar::tab:selected {{
+            background: {BG_MID}; 
+            color: white;
+            font-weight: bold;
+            border-bottom: 2px solid {ACCENT_BLUE}; 
+        }}
+        
+        QTabBar::tab:hover {{
+            background: #4a5160;
+        }}
+        
+        /* --- Progress Bar --- */
+        QProgressBar {{
+            border: 1px solid {BORDER_GRAY};
+            border-radius: 5px;
+            text-align: center;
+            color: {TEXT_COLOR};
+            background-color: {BG_LIGHT};
+        }}
+        QProgressBar::chunk {{
+            background-color: {ACCENT_BLUE};
+            border-radius: 5px;
+        }}
+
+        
+        /* --- Graphics View (Main Image Area) --- */
+        QGraphicsView {{
+            border: 1px solid {BORDER_GRAY};
+            border-radius: 6px;
+        }}
         """
         self.setStyleSheet(style_sheet)
-
+        
+    
+    # --- MCU Pixel Extraction with Pillow (Unchanged) ---
     def get_mcu_block_pixmap(self, r, c):
         if not self.current_filepath or not self.current_mcu_data: return QPixmap()
+
         data = self.current_mcu_data
         x_start = c * data['mcu_x']
         y_start = r * data['mcu_y']
+        
+        # Calculate crop box (x_min, y_min, x_max, y_max)
         crop_box = (x_start, y_start, x_start + data['mcu_x'], y_start + data['mcu_y'])
+        
         try:
             img = Image.open(self.current_filepath)
             mcu_img = img.crop(crop_box)
-            if self.view_mode != "YCbCr":
-                ycbcr = mcu_img.convert('YCbCr')
-                channels = ycbcr.split()
-                target_channel = None
-                mode = self.view_mode
-                if mode == "Y": target_channel = channels[0]
-                elif mode == "Cb": target_channel = channels[1]
-                elif mode == "Cr": target_channel = channels[2]
-                if target_channel: mcu_img = target_channel
             
             buffer = QBuffer()
             buffer.open(QIODevice.OpenModeFlag.ReadWrite)
+            # Save as PNG to QBuffer to get a Pixmap for display
             mcu_img.save(buffer, "PNG") 
             pixmap = QPixmap()
             pixmap.loadFromData(buffer.data())
             return pixmap
+            
+        except ImportError:
+            QMessageBox.critical(self, "Error", "Pillow library not found. Cannot display MCU pixels.")
         except Exception:
             pass
         return QPixmap()
 
+
+    # --- Display/Feedback Methods (Unchanged) ---
     def display_hover_info(self, r, c):
         mcu_pixmap = self.get_mcu_block_pixmap(r, c)
         self.pixel_block_preview.update_pixmap(mcu_pixmap)
@@ -3485,13 +3996,17 @@ class MainWindow(QMainWindow):
     def display_mcu_info(self, r, c):
         if not self.current_mcu_data or not self.grid_item: return
         data = self.current_mcu_data
+        
         mcu_pixmap = self.get_mcu_block_pixmap(r, c)
         self.selected_block_preview.update_pixmap(mcu_pixmap)
         
         n_mcu_x = self.grid_item.n_mcu_x
+
         mcu_index = r * n_mcu_x + c + 1
+        
         x_start = c * data['mcu_x']
         y_start = r * data['mcu_y']
+        
         x_end = min((c + 1) * data['mcu_x'] - 1, data['width'] - 1)
         y_end = min((r + 1) * data['mcu_y'] - 1, data['height'] - 1)
         
@@ -3503,9 +4018,11 @@ class MainWindow(QMainWindow):
         self.pixel_range_label.setText(f"X: {x_start}-{x_end}, Y: {y_start}-{y_end}")
         
         avg_ycbr = get_mcu_avg_ycbr_values(self.current_filepath, data, r, c)
+        
         if avg_ycbr:
             y, cb, cr = avg_ycbr
-            self.avg_ycbr_label.setText(f"Y: {y:.2f}, Cb: {cb:.2f}, Cr: {cr:.2f}")
+            ycbr_text = f"Y: {y:.2f}, Cb: {cb:.2f}, Cr: {cr:.2f}"
+            self.avg_ycbr_label.setText(ycbr_text)
         else:
             self.avg_ycbr_label.setText("Y: ---, Cb: ---, Cr: --- (Error)")
 
@@ -3522,33 +4039,47 @@ class MainWindow(QMainWindow):
         self.selected_block_preview.set_active_state(False)
         self.clear_hover_info()
 
+
+    # --- Image Loading Logic (Unchanged) ---
     def load_and_display_image(self, filepath):
+        
         image_pixmap = QPixmap(filepath)
         if image_pixmap.isNull():
+            # Only reset GUI if original load fails
             if filepath == self.original_filepath:
-                QMessageBox.critical(self, "Error", "Failed to load image file.")
+                QMessageBox.critical(self, "Error", "Failed to load image file. Check file path/permissions.")
                 self.reset_gui()
+            # If a repair file fails to load, keep the original loaded state
             else:
-                QMessageBox.critical(self, "Error", f"Failed to load repaired image: {os.path.basename(filepath)}.")
+                 QMessageBox.critical(self, "Error", f"Failed to load repaired image: {os.path.basename(filepath)}. Keeping current view.")
             return
 
         mcu_data = get_jpeg_mcu_data(filepath)
+        
         if mcu_data:
             mcu_data['width'] = image_pixmap.width()
             mcu_data['height'] = image_pixmap.height()
             self.current_mcu_data = mcu_data
-            self.current_filepath = filepath
+            self.current_filepath = filepath # Update current path if successful
             
-            self.dim_label_mini.setText(f"{mcu_data['width']} x {mcu_data['height']}")
-            self.mcu_label_mini.setText(f"{mcu_data['mcu_x']} x {mcu_data['mcu_y']}")
-            self.current_file_label_mini.setText(os.path.basename(filepath))
+            dim_text = f"{mcu_data['width']} x {mcu_data['height']}"
+            mcu_text = f"{mcu_data['mcu_x']} x {mcu_data['mcu_y']}"
+            file_name = os.path.basename(filepath)
             
+            self.dim_label_mini.setText(dim_text)
+            self.mcu_label_mini.setText(mcu_text)
+            self.current_file_label_mini.setText(file_name)
+            
+            # 1. Vertical Gray Scanline Detection (for Header Crop)
             try:
                 vertical_gray_count, total_scanlines, _ = count_gray_mcu_scanlines(filepath, mcu_data)
+                
                 self.vertical_gray_scanlines_to_remove = vertical_gray_count
+                
                 if total_scanlines > 0:
                     percentage = (vertical_gray_count / total_scanlines) * 100
-                    self.gray_scanline_count_label_mini.setText(f"{vertical_gray_count} / {total_scanlines} ({percentage:.1f}%)")
+                    scanline_text = f"{vertical_gray_count} / {total_scanlines} ({percentage:.1f}%)"
+                    self.gray_scanline_count_label_mini.setText(scanline_text)
                     self.execute_header_crop_button.setEnabled(vertical_gray_count > 0)
                 else:
                     self.gray_scanline_count_label_mini.setText("0 / 0 (0%)")
@@ -3556,111 +4087,62 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 self.gray_scanline_count_label_mini.setText("Error / --- (0%)")
                 self.execute_header_crop_button.setEnabled(False)
+                print(f"Error during gray scanline analysis: {e}", file=sys.stderr)
             
+            # 2. Horizontal MCU Analysis (for Auto Alignment)
             try:
                 horizontal_gray_mcu_count = analyze_last_scanline_mcus(filepath, mcu_data)
                 self.post_crop_gray_mcu_count = horizontal_gray_mcu_count
+                
+                # Auto alignment is enabled only if blocks need to be inserted 
+                # AND it's a file that has been processed (i.e., not the initial load)
                 is_initial_file = (self.original_filepath == filepath)
+                
                 if not is_initial_file and horizontal_gray_mcu_count > 0:
                     self.auto_align_button.setEnabled(True)
+                    # Inserted blocks = gray count remaining + 1 (the original block that was short)
                     insert_blocks = horizontal_gray_mcu_count + 1 
                     self.auto_align_button.setText(f"Auto Alignment (Insert {insert_blocks} Blocks at Header)")
                 else:
                     self.auto_align_button.setEnabled(False)
                     self.auto_align_button.setText("Auto Alignment")
+
+
             except Exception as e:
                 self.post_crop_gray_mcu_count = 0
                 self.auto_align_button.setEnabled(False)
+                self.auto_align_button.setText("Auto Alignment")
+                print(f"Error during auto alignment analysis: {e}", file=sys.stderr)
 
-            display_pixmap = self.get_channel_pixmap(filepath, self.view_mode)
+
             self.scene.clear()
-            self.grid_item = McuGridItem(mcu_data, display_pixmap, self)
+            self.grid_item = McuGridItem(mcu_data, image_pixmap, self)
             self.scene.addItem(self.grid_item)
             self.scene.setSceneRect(self.grid_item.boundingRect())
+            
             self.view.fitInView(self.grid_item, Qt.AspectRatioMode.KeepAspectRatio)
             self.grid_item.setFocus(Qt.FocusReason.NoFocusReason)
             
+            # Enable all main controls
             self.insert_button.setEnabled(True)
             self.delete_button.setEnabled(True)
             self.reset_button.setEnabled(True) 
             self.toggle_grid_button.setEnabled(True) 
-            self.view_hex_button.setEnabled(True)
-            self.view_exif_button.setEnabled(True)
             self.cdelta_button.setEnabled(True) 
             self.auto_color_button.setEnabled(True) 
-            self.toggle_grid_button.setText("Show MCU Grid")
+            
+            self.toggle_grid_visibility()
+            self.toggle_grid_visibility() 
             
             self.clear_mcu_info() 
+            # Simulate click on (0, 0) to initialize selection
             self.grid_item.mousePressEvent(self._create_fake_event()) 
         else:
             self.reset_gui()
-
-    def set_view_mode(self, mode):
-        self.view_mode = mode
-        self.action_ycbcr.setChecked(mode == "YCbCr")
-        self.action_y.setChecked(mode == "Y")
-        self.action_cb.setChecked(mode == "Cb")
-        self.action_cr.setChecked(mode == "Cr")
-        self.update_image_view_mode()
-        c = getattr(self, 'selected_mcu_c', 0)
-        r = getattr(self, 'selected_mcu_r', 0)
-        self.display_mcu_info(r, c)
-
-    def update_image_view_mode(self):
-        if not self.current_filepath or not self.grid_item: return
-        display_pixmap = self.get_channel_pixmap(self.current_filepath, self.view_mode)
-        self.grid_item.pixmap = display_pixmap
-        self.grid_item.update()
-
-    def get_channel_pixmap(self, filepath, mode):
-        if not filepath or not os.path.exists(filepath): return QPixmap()
-        if mode == "YCbCr": return QPixmap(filepath)
-        try:
-            img = Image.open(filepath)
-            ycbcr = img.convert('YCbCr')
-            channels = ycbcr.split()
-            target_channel = None
-            if mode == "Y": target_channel = channels[0]
-            elif mode == "Cb": target_channel = channels[1]
-            elif mode == "Cr": target_channel = channels[2]
-            if target_channel:
-                img_data = target_channel.tobytes()
-                qimg = QImage(img_data, target_channel.size[0], target_channel.size[1], target_channel.size[0], QImage.Format.Format_Grayscale8)
-                return QPixmap.fromImage(qimg)
-        except Exception:
-            pass
-        return QPixmap(filepath)
-
-    def show_view_context_menu(self, pos):
-        if not self.current_filepath: return
-        menu = QMenu(self.view)
-        menu.addAction(self.action_ycbcr)
-        menu.addSeparator()
-        menu.addAction(self.action_y)
-        menu.addAction(self.action_cb)
-        menu.addAction(self.action_cr)
-        menu.addSeparator()
-        action_menu_hex = QAction("View Hex", self)
-        action_menu_hex.triggered.connect(self.show_hex_viewer)
-        menu.addAction(action_menu_hex)
-        action_menu_exif = QAction("View EXIF Info", self)
-        action_menu_exif.triggered.connect(self.show_exif_inspector)
-        menu.addAction(action_menu_exif)
-        menu.exec(self.view.mapToGlobal(pos))
-
-    def show_hex_viewer(self):
-        if not self.current_filepath or not os.path.exists(self.current_filepath):
-            QMessageBox.warning(self, "Warning", "Please load a JPEG file first.")
-            return
-        HexViewerDialog(self.current_filepath, self).exec()
-
-    def show_exif_inspector(self):
-        if not self.current_filepath or not os.path.exists(self.current_filepath):
-            QMessageBox.warning(self, "Warning", "Please load a JPEG file first.")
-            return
-        ExifInspectorDialog(self.current_filepath, self).exec()
-
+            
+    # --- Reset GUI (Unchanged) ---
     def reset_gui(self):
+        # Reset Mini Labels
         self.current_file_label_mini.setText("No file loaded")
         self.dim_label_mini.setText("--- x ---")
         self.mcu_label_mini.setText("--- x ---")
@@ -3668,50 +4150,75 @@ class MainWindow(QMainWindow):
         self.auto_align_button.setText("Auto Alignment")
         self.post_crop_gray_mcu_count = 0 
         self.vertical_gray_scanlines_to_remove = 0 
+        
         self.scene.clear()
         self.current_mcu_data = None
         self.current_filepath = None
         self.original_filepath = None
         self.grid_item = None
+        
+        # Clear Selection/Averge Info
         self.clear_mcu_info()
         self.avg_ycbr_label.setText("Y: ---, Cb: ---, Cr: ---")
+        
+        # Disable all controls
         self.insert_button.setEnabled(False)
         self.delete_button.setEnabled(False)
         self.reset_button.setEnabled(False)
         self.toggle_grid_button.setEnabled(False) 
-        self.view_hex_button.setEnabled(False)
-        self.view_exif_button.setEnabled(False)
         self.cdelta_button.setEnabled(False) 
         self.execute_header_crop_button.setEnabled(False) 
         self.auto_align_button.setEnabled(False) 
         self.auto_color_button.setEnabled(False) 
+        
+        # Reset SpinBox/Sliders
         self.mcu_block_num_input.setValue(1) 
         self.y_slider.setValue(0)
         self.cb_slider.setValue(0)
         self.cr_slider.setValue(0)
+        
+        # Reset Batch UI
         self.progress_bar.setValue(0)
         self.output_text.clear()
+        
         self.selected_block_preview.set_active_state(False)
         self.clear_hover_info()
 
+    # --- Utility Methods (Unchanged) ---
     def toggle_grid_visibility(self):
         if self.grid_item:
             self.grid_item.grid_visible = not self.grid_item.grid_visible
             self.grid_item.update()
-            self.toggle_grid_button.setText("Hide MCU Grid" if self.grid_item.grid_visible else "Show MCU Grid")
+            
+            if self.grid_item.grid_visible:
+                self.toggle_grid_button.setText("Hide MCU Grid")
+            else:
+                self.toggle_grid_button.setText("Show MCU Grid")
         
     def open_file(self):
-        filepath, _ = QFileDialog.getOpenFileName(self, "Open JPEG Image", os.path.expanduser("~"), "JPEG Files (*.jpg *.jpeg)")
+        filepath, _ = QFileDialog.getOpenFileName(
+            self, "Open JPEG Image", os.path.expanduser("~"), "JPEG Files (*.jpg *.jpeg)"
+        )
         if not filepath: return
+        
         self.original_filepath = filepath
         self.current_filepath = filepath
         self.load_and_display_image(filepath)
 
     def reset_to_original(self):
-        if not self.original_filepath: return
-        if self.current_filepath == self.original_filepath: return
+        if not self.original_filepath:
+            QMessageBox.warning(self, "Warning", "No original file path stored.")
+            return
+
+        if self.current_filepath == self.original_filepath:
+             QMessageBox.information(self, "Info", "The original file is already being displayed.")
+             return
+             
         self.current_filepath = self.original_filepath
         self.load_and_display_image(self.original_filepath)
+        QMessageBox.information(self, "Reset", f"Successfully reloaded: {os.path.basename(self.original_filepath)}")
+        
+        # Reset cdelta sliders and MCU Block Num
         self.mcu_block_num_input.setValue(1) 
         self.y_slider.setValue(0)
         self.cb_slider.setValue(0)
@@ -3723,81 +4230,157 @@ class MainWindow(QMainWindow):
             def pos(self): return QPointF(0, 0)
         return FakeMouseEvent()
     
+    # ======================================================================
+    # --- SINGLE-FILE REPAIR LOGIC (Unchanged) ---
+    # ======================================================================
     def get_repair_filepaths(self):
+        """
+        Determines input and output file paths for single-file operation.
+        The output file is always saved to 'Repaired/[Original Filename]' and OVERWRITES.
+        """
         base_path = self.original_filepath 
-        if not base_path: return None, None
+        if not base_path:
+            return None, None
+            
         input_dir = os.path.dirname(base_path) 
         repaired_dir = os.path.join(input_dir, "Repaired")
+        
         try:
             os.makedirs(repaired_dir, exist_ok=True)
-        except Exception:
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to create Repaired directory: {e}")
             return None, None
+            
         original_filename = os.path.basename(base_path)
-        output_file = os.path.normpath(os.path.abspath(os.path.join(repaired_dir, original_filename)))
-        input_file = os.path.normpath(os.path.abspath(self.current_filepath))
+        output_file = os.path.join(repaired_dir, original_filename)
+        input_file = self.current_filepath
+        
         return input_file, output_file
 
     def execute_jpegrepair(self, command, operation):
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        exe_path = os.path.normpath(os.path.join(script_dir, "jpegrepair.exe"))
+        script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+        exe_path = os.path.join(script_dir, "jpegrepair.exe")
 
         if not os.path.exists(exe_path):
             return False, f"Executable not found: {exe_path}. Ensure it is in the same folder as this script."
         
-        command.insert(0, exe_path)
+        command.insert(0, exe_path) 
+        
         try:
             process = subprocess.run(command, capture_output=True, text=True, check=False)
+            
             if process.returncode == 0:
                 return True, ""
             else:
                 error_output = process.stderr if process.stderr else "No specific error output."
                 return False, f"Execution failed for {operation} with return code {process.returncode}.\nError:\n{error_output}"
+
         except Exception as e:
             return False, f"An unexpected error occurred during execution: {e}"
 
+    # --- Remove Gray Scanlines Method ---
     def remove_gray_scanlines(self):
-        if not self.current_filepath or not self.current_mcu_data: return
+        if not self.current_filepath or not self.current_mcu_data:
+            QMessageBox.warning(self, "Warning", "Please load a JPEG file first.")
+            return
+
         scanlines_to_remove = self.vertical_gray_scanlines_to_remove
-        if scanlines_to_remove <= 0: return
+        
+        if scanlines_to_remove <= 0:
+            QMessageBox.information(self, "Info", "Zero gray MCU scanlines found. No cropping performed.")
+            return
             
         input_file, output_file = self.get_repair_filepaths() 
         if not input_file: return
         
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        
         success = crop_jpeg_by_header(input_file, output_file, scanlines_to_remove)
+
         QApplication.restoreOverrideCursor()
 
         if success:
+            QMessageBox.information(
+                self, 
+                "Success", 
+                f"Successfully cropped {scanlines_to_remove} gray MCU scanlines by modifying the JPEG header.\nOutput saved to: {os.path.basename(output_file)} (Overwritten)\n\nReloading view."
+            )
             self.load_and_display_image(output_file) 
+            
+            if self.auto_align_button.isEnabled():
+                QMessageBox.warning(self, "Post-Crop Check", f"Post-crop misalignment detected. **Auto Alignment is now enabled.**")
+            else:
+                QMessageBox.information(self, "Post-Crop Check", "The crop fixed the issue. Auto Alignment not necessary.")
         else:
+            QMessageBox.critical(
+                self, 
+                "Crop Failed", 
+                "Header modification failed. Check the console for more specific error details or file write permissions."
+            )
             self.auto_align_button.setEnabled(False)
             
+    # --- Auto Alignment Method ---
     def run_auto_alignment(self):
-        if not self.current_filepath or not self.current_mcu_data: return
+        if not self.current_filepath or not self.current_mcu_data:
+            QMessageBox.warning(self, "Warning", "Please load a JPEG file first.")
+            return
+
         gray_count_remaining = self.post_crop_gray_mcu_count
         mcu_block_num = gray_count_remaining + 1
-        if mcu_block_num <= 1: return
+        
+        if mcu_block_num <= 1:
+            QMessageBox.information(
+                self, 
+                "Alignment Info", 
+                "Post-crop gray MCU count is 0. Auto Alignment not necessary."
+            )
+            self.auto_align_button.setEnabled(False)
+            return
 
+        operation = f"Align_{mcu_block_num}B" 
+        c = 0
+        r = 0 
+        
         input_file, output_file = self.get_repair_filepaths() 
         if not input_file: return
-        command = [input_file, output_file, "dest", "0", "0", "insert", str(mcu_block_num)]
+        
+        command = [
+            input_file,
+            output_file,
+            "dest",
+            str(c), 
+            str(r),
+            "insert", 
+            str(mcu_block_num)
+        ]
         
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        success, error_msg = self.execute_jpegrepair(command, "Auto Alignment")
+        success, error_msg = self.execute_jpegrepair(command, f"Auto Alignment ({operation})")
         QApplication.restoreOverrideCursor()
         
         if success:
+            QMessageBox.information(
+                self, 
+                "Auto Alignment Success", 
+                f"Auto Alignment completed by inserting {mcu_block_num} blocks at MCU ({c}, {r}).\nOutput saved to: {os.path.basename(output_file)} (Overwritten)\n\nReloading view."
+            )
             self.load_and_display_image(output_file)
             self.auto_align_button.setEnabled(False) 
         else:
+            QMessageBox.critical(self, "Auto Alignment Failed", error_msg)
             self.auto_align_button.setEnabled(True) 
             
+    # --- Auto Color Correction Method (Pillow/PhotoDemon) ---
     def run_auto_color_correction(self):
-        if not self.current_filepath: return
+        if not self.current_filepath:
+            QMessageBox.warning(self, "Warning", "Please load a JPEG file first.")
+            return
+
         input_file, output_file = self.get_repair_filepaths() 
         if not input_file: return
 
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        
         try:
             original_img = Image.open(input_file)
             corrected_img = photodemon_autocorrect_image(original_img)
@@ -3805,74 +4388,169 @@ class MainWindow(QMainWindow):
             success = True
         except Exception as e:
             success = False
+            error_msg = f"Failed to apply PhotoDemon Auto-Correction (WB/Clarity).\nError details: {e}"
             
         QApplication.restoreOverrideCursor()
+
         if success:
+            QMessageBox.information(
+                self, 
+                "Auto-Correction Success", 
+                f"PhotoDemon Auto Color/Lighting Correction applied.\nOutput saved to: {os.path.basename(output_file)} (Overwritten)\n\nReloading view."
+            )
             self.load_and_display_image(output_file)
+            
+            # Reset CDelta sliders since this is a new color process
             self.y_slider.setValue(0)
             self.cb_slider.setValue(0)
             self.cr_slider.setValue(0)
+            
+        else:
+            QMessageBox.critical(self, "Auto-Correction Failed", error_msg)
 
+    # --- Run CDelta Repair Method ---
     def run_cdelta_repair(self):
-        if not self.current_filepath: return
-        deltas = {0: self.y_slider.value(), 1: self.cb_slider.value(), 2: self.cr_slider.value()}
-        if all(v == 0 for v in deltas.values()): return
+        if not self.current_filepath:
+            QMessageBox.warning(self, "Warning", "Please load a JPEG file first.")
+            return
+            
+        deltas = {
+            0: self.y_slider.value(),   # Y
+            1: self.cb_slider.value(),  # Cb
+            2: self.cr_slider.value()   # Cr
+        }
+        
+        if all(v == 0 for v in deltas.values()):
+            QMessageBox.information(self, "Info", "All color corrections are set to 0. No operation executed.")
+            return
 
+        # 1. Get the final desired output path
         _, final_output_file = self.get_repair_filepaths() 
         if not final_output_file: return
+        
         active_components = [i for i, v in deltas.items() if v != 0]
 
+        # Setup temp file path for intermediate steps
         base_dir = os.path.dirname(final_output_file)
         ext = os.path.splitext(final_output_file)[1]
         temp_output_file = os.path.join(base_dir, f"temp_cdelta_{os.getpid()}{ext}")
+
         current_input_file = self.current_filepath
         
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         all_successful = True
+        error_message = ""
+
         try:
             for comp_index in active_components:
                 value = deltas[comp_index]
-                is_last = (comp_index == active_components[-1])
-                output_path = final_output_file if is_last else temp_output_file
-                command = [current_input_file, output_path, "dest", "0", "0", "cdelta", str(comp_index), str(value)]
-                success, _ = self.execute_jpegrepair(command, f"cdelta {comp_index}")
+                is_last_component = (comp_index == active_components[-1])
+                
+                output_path = final_output_file if is_last_component else temp_output_file
+                
+                operation = f"cdelta {comp_index} {value}"
+                
+                command = [
+                    current_input_file,
+                    output_path, 
+                    "dest",
+                    str(0), 
+                    str(0), 
+                    "cdelta",
+                    str(comp_index),
+                    str(value)
+                ]
+                
+                success, error_msg = self.execute_jpegrepair(command, operation)
+                
                 if not success:
                     all_successful = False
+                    error_message = error_msg
                     break 
+
                 current_input_file = output_path
+
         finally:
             QApplication.restoreOverrideCursor()
-            if os.path.exists(temp_output_file): os.remove(temp_output_file)
+            # Clean up the temporary file if it was created and still exists
+            if os.path.exists(temp_output_file):
+                os.remove(temp_output_file)
         
+        # 2. Final Load
         if all_successful:
+            QMessageBox.information(
+                self, 
+                "Success", 
+                f"Color Correction (cdelta) completed. Output saved to: {os.path.basename(final_output_file)} (Overwritten)\n\nReloading view."
+            )
             self.load_and_display_image(final_output_file)
+            
+        else:
+            QMessageBox.critical(
+                self, 
+                "Repair Failed", 
+                f"One or more color corrections failed.\n\nError:\n{error_message}"
+            )
 
+    # --- Run Insert/Delete MCU Method ---
     def run_repair(self, operation):
-        if not self.current_filepath: return
+        if not self.current_filepath:
+            QMessageBox.warning(self, "Warning", "Please load a JPEG file first.")
+            return
+
         mcu_block_num = self.mcu_block_num_input.value()
-        c, r = getattr(self, 'selected_mcu_c', 0), getattr(self, 'selected_mcu_r', 0)
+        
+        c = getattr(self, 'selected_mcu_c', 0)
+        r = getattr(self, 'selected_mcu_r', 0)
+        
         input_file, output_file = self.get_repair_filepaths()
         if not input_file: return
         
-        command = [input_file, output_file, "dest", str(c), str(r), operation, str(mcu_block_num)]
+        command = [
+            input_file,
+            output_file,
+            "dest",
+            str(c), 
+            str(r),
+            operation,
+            str(mcu_block_num)
+        ]
+        
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        success, _ = self.execute_jpegrepair(command, operation)
+        success, error_msg = self.execute_jpegrepair(command, operation)
         QApplication.restoreOverrideCursor()
         
         if success:
+            QMessageBox.information(
+                self, 
+                "Success", 
+                f"MCU {operation} completed. Output saved to: {os.path.basename(output_file)} (Overwritten)\n\nReloading view."
+            )
             self.load_and_display_image(output_file)
+        else:
+            QMessageBox.critical(self, "Repair Failed", error_msg)
 
+    # ======================================================================
+    # --- BATCH PROCESSING LOGIC (NEW) ---
+    # ======================================================================
+
+    # --- Button Callbacks (Provided by user) ---
     def selectReferenceJPEG(self):
-        fileName, _ = QFileDialog.getOpenFileName(self, "Select Reference JPEG", "", "JPEG Files (*.jpg *.jpeg);;All Files (*)")
-        if fileName: self.reference_jpeg_input.setText(fileName)
+        fileName, _ = QFileDialog.getOpenFileName(self, "Select Reference JPEG", "", "JPEG Files (*.jpg);;All Files (*)")
+        if fileName:
+            self.reference_jpeg_input.setText(fileName)
 
     def selectEncryptedFolder(self):
         folderName = QFileDialog.getExistingDirectory(self, "Select Encrypted Folder")
-        if folderName: self.encrypted_folder_input.setText(folderName)
+        if folderName:
+            self.encrypted_folder_input.setText(folderName)
 
+    # --- User's File Manipulation Helpers ---
     def find_ffda_offset(self, data):
-        ffda_offset = data.rfind(b'\xFF\xDA')
-        if ffda_offset == -1: raise ValueError("FFDA marker not found.")
+        ffda_marker = b'\xFF\xDA'
+        ffda_offset = data.rfind(ffda_marker)
+        if ffda_offset == -1:
+            raise ValueError("FFDA marker (Start of Scan) not found in reference JPEG.")
         return ffda_offset
 
     def remove_exif(self, data):
@@ -3880,13 +4558,11 @@ class MainWindow(QMainWindow):
         while i < len(data) - 1:
             if data[i] == 0xFF:
                 marker = data[i:i+2]
-                if marker == b'\xFF\xE1':
+                if marker == b'\xFF\xE1': # APP1 (EXIF) marker
                     length = int.from_bytes(data[i+2:i+4], 'big') + 2
                     data = data[:i] + data[i+length:]
                     continue
-                elif marker == b'\xFF\xDA':
-                    break
-                elif marker not in (b'\xFF\xD8', b'\xFF\xD9'):
+                elif marker not in (b'\xFF\xD8', b'\xFF\xD9'): # Not SOI or EOI
                     if len(data) < i + 4: break
                     try:
                         length = int.from_bytes(data[i+2:i+4], 'big') + 2
@@ -3898,134 +4574,197 @@ class MainWindow(QMainWindow):
         return data
 
     def _initial_file_manipulation(self, reference_path, encrypted_path, output_path):
-        with open(encrypted_path, 'rb') as f: encrypted_data = f.read()
-        with open(reference_path, 'rb') as f: reference_data = f.read()
+        """Initial merge/cleaning step using user-provided fixed offsets."""
+        with open(encrypted_path, 'rb') as encrypted_file:
+            encrypted_data = encrypted_file.read()
+
+        with open(reference_path, 'rb') as reference_file:
+            reference_data = reference_file.read()
+
         ffda_offset = self.find_ffda_offset(reference_data)
+        # Use fixed offsets provided by the user's process_jpeg logic
         cut_reference_data = reference_data[:ffda_offset + 12]
+        
         repaired_data = cut_reference_data + encrypted_data[153605:]
         repaired_data = self.remove_exif(repaired_data)
         repaired_data = repaired_data[:-334]
-        with open(output_path, 'wb') as f: f.write(repaired_data)
+
+        with open(output_path, 'wb') as output_file:
+            output_file.write(repaired_data)
+
+    # --- Internal Batch Repair Helpers ---
 
     def _batch_step_header_crop(self, input_path, output_path):
+        """1. Remove MCU Gray Scanlines - Batch Version"""
         mcu_data = get_jpeg_mcu_data(input_path)
-        if not mcu_data: return False, "Error reading MCU data."
+        if not mcu_data: return False, f"Error: Cannot read MCU data from {os.path.basename(input_path)}."
+
         vertical_gray_count, _, _ = count_gray_mcu_scanlines(input_path, mcu_data)
+        
         if vertical_gray_count <= 0:
             shutil.copy2(input_path, output_path)
             return True, output_path
+            
         success = crop_jpeg_by_header(input_path, output_path, vertical_gray_count)
-        return success, output_path
+
+        if success:
+            return True, output_path
+        else:
+            return False, f"Failed to crop {vertical_gray_count} scanlines."
 
     def _batch_step_auto_align(self, input_path, output_path):
+        """2. Auto Alignment (Insert Blocks at Header) - Batch Version"""
         mcu_data = get_jpeg_mcu_data(input_path)
         if not mcu_data: 
-            shutil.copy2(input_path, output_path)
-            return True, output_path
+            shutil.copy2(input_path, output_path) # Copy to ensure file exists for next step
+            return True, output_path # Alignment not possible/needed
+        
         horizontal_gray_mcu_count = analyze_last_scanline_mcus(input_path, mcu_data)
         mcu_block_num = horizontal_gray_mcu_count + 1
+        
         if mcu_block_num <= 1:
             shutil.copy2(input_path, output_path)
             return True, output_path
-        command = [input_path, output_path, "dest", "0", "0", "insert", str(mcu_block_num)]
-        success, error_msg = self.execute_jpegrepair(command, "Auto Align")
-        return success, error_msg
+
+        command = [
+            input_path, output_path, "dest", str(0), str(0), "insert", str(mcu_block_num)
+        ]
+        
+        success, error_msg = self.execute_jpegrepair(command, f"Auto Align ({mcu_block_num} blocks)")
+        
+        if success:
+            return True, output_path
+        else:
+            return False, error_msg
 
     def _batch_step_auto_color(self, input_path, output_path):
+        """3. Apply PhotoDemon WB + Clarity - Batch Version"""
         try:
             original_img = Image.open(input_path)
             corrected_img = photodemon_autocorrect_image(original_img)
             corrected_img.save(output_path, quality=92, optimize=True) 
             return True, output_path
         except Exception as e:
-            return False, str(e)
+            return False, f"Failed to apply PhotoDemon Auto-Correction (WB/Clarity): {e}"
 
     def process_jpeg_batch(self, input_file, reference_path, output_file):
+        """Chains the full three-step repair for a single file in the batch."""
         base_dir = os.path.dirname(output_file)
+        # Use unique PID temp file to manage intermediate results
         temp_pre_process_file = os.path.join(base_dir, f"temp_pre_process_{os.getpid()}_{os.path.basename(input_file)}")
+        
+        # 1. Initial Merge/Clean (User's original logic)
         try:
             self._initial_file_manipulation(reference_path, input_file, temp_pre_process_file)
         except Exception as e:
-            return False, str(e)
+            return False, f"Initial file manipulation failed: {e}"
         
         current_input_file = temp_pre_process_file
         temp_files_to_cleanup = [temp_pre_process_file]
+        
         try:
+            # 2. Header Crop
             temp_crop_file = os.path.join(base_dir, f"temp_batch_{os.getpid()}_crop.jpg")
             success, result = self._batch_step_header_crop(current_input_file, temp_crop_file)
-            if not success: return False, result
+            if not success: return False, f"Header Crop failed: {result}"
             current_input_file = result
             temp_files_to_cleanup.append(temp_crop_file)
             
+            # 3. Auto Alignment
             temp_align_file = os.path.join(base_dir, f"temp_batch_{os.getpid()}_align.jpg")
             success, result = self._batch_step_auto_align(current_input_file, temp_align_file)
-            if not success: return False, result
+            if not success: return False, f"Auto Alignment failed: {result}"
             current_input_file = result
             temp_files_to_cleanup.append(temp_align_file)
             
+            # 4. Auto Color Correction (Final Step - outputs to final path)
             success, result = self._batch_step_auto_color(current_input_file, output_file)
-            if not success: return False, result
+            if not success: return False, f"Auto Color failed: {result}"
+            
             return True, output_file
+            
         finally:
+            # Cleanup all intermediate files
             for f in temp_files_to_cleanup:
-                if os.path.exists(f):
-                    try: os.remove(f)
-                    except Exception: pass
+                if os.path.exists(f): 
+                    try:
+                        os.remove(f)
+                    except Exception:
+                        pass # Ignore cleanup errors
+
 
     def repairJPEGs(self):
+        """Main batch loop provided by the user, modified to use chained repair logic."""
         reference_jpeg = self.reference_jpeg_input.text().strip()
         encrypted_folder = self.encrypted_folder_input.text().strip()
+
         if not os.path.exists(reference_jpeg) or not os.path.isdir(encrypted_folder):
-            QMessageBox.critical(self, "Error", "Please check your paths.")
+            QMessageBox.critical(self, "Error", "Please ensure the reference JPEG and encrypted folder paths are valid.")
             return
 
         repaired_folder = os.path.join(encrypted_folder, "Repaired")
         os.makedirs(repaired_folder, exist_ok=True)
+        
+        # Pattern from user's request
         pattern = re.compile(r".*\.JPG\..{4}$", re.I)
         encrypted_files = [f for f in os.listdir(encrypted_folder) if pattern.match(f)]
-        if not encrypted_files: return
+        
+        if not encrypted_files:
+            QMessageBox.information(self, "Info", "No files matching the pattern '*.JPG.xxxx' found in the folder.")
+            return
 
         self.progress_bar.setMaximum(len(encrypted_files))
         self.progress_bar.setValue(0)
         self.output_text.clear()
         
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        
         successful_count = 0
         total_count = len(encrypted_files)
+
         try:
             for i, encrypted_file in enumerate(encrypted_files):
+                # Calculate the final output name based on user's original logic
                 input_file_path = os.path.join(encrypted_folder, encrypted_file)
                 output_name = os.path.splitext(encrypted_file)[0].rsplit('.', 1)[0] + '.JPG'
                 output_file_path = os.path.join(repaired_folder, output_name)
                 
                 self.output_text.append(f"Starting: {encrypted_file} -> {output_name}")
-                success, _ = self.process_jpeg_batch(input_file_path, reference_jpeg, output_file_path)
+                
+                success, result_path_or_error = self.process_jpeg_batch(input_file_path, reference_jpeg, output_file_path)
+                
                 if success:
+                    self.output_text.append(f"  SUCCESS: All 3 steps completed.")
                     successful_count += 1
+                    
+                    # Auto load the image when processed, as requested by the user
                     self.original_filepath = output_file_path
                     self.load_and_display_image(output_file_path) 
+                else:
+                    self.output_text.append(f"  ERROR: {result_path_or_error}")
+                    
                 self.progress_bar.setValue(i + 1)
-                QApplication.processEvents()
         finally:
             QApplication.restoreOverrideCursor()
+            
+        self.output_text.append(f"\nBatch Repair complete. {successful_count} of {total_count} files successfully processed.")
+        QMessageBox.information(
+            self, 
+            "Batch Complete", 
+            f"Batch Repair finished.\nProcessed: {total_count}\nSuccessful: {successful_count}"
+        )
 
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        if self.grid_item:
-            self.view.fitInView(self.grid_item, Qt.AspectRatioMode.KeepAspectRatio)
 
+# --- Run the Application ---
 if __name__ == '__main__':
     if hasattr(sys, 'frozen') and sys.platform == 'win32':
         qt_plugin_path = os.path.join(os.path.dirname(sys.executable), 'PyQt6', 'Qt6', 'plugins')
         if os.path.isdir(qt_plugin_path):
              os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = qt_plugin_path
              
-    app = QApplication(sys.argv)
-    app_font = app.font()
-    app_font.setFamily("Segoe UI")
-    app_font.setPointSize(10)
-    app.setFont(app_font)
+    os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "1"
     
+    app = QApplication(sys.argv)
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
